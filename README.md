@@ -16,9 +16,11 @@ save/load, and a small CREXX-facing API for running goals from CREXX programs.
 | `crexxcallback.crexx`, `caller_example.crexx` | calling Prolog from CREXX |
 | `family.pl`, `recur.pl` | sample Prolog programs |
 | `build_with_prolog.sh` | build helper |
+| `crexx-dist/` | the CREXX distribution's copy (`examples/prolog-in-crexx`) |
 
 This is the original version. The copy in the CREXX distribution
-(`examples/prolog-in-crexx`) was derived from it and has since diverged.
+(`examples/prolog-in-crexx`) was derived from it and has since diverged; it
+is in `crexx-dist/` (with its Prolog source-buffer API and RXPP samples).
 
 ## C89 port
 
