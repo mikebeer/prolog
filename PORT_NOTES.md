@@ -373,3 +373,132 @@ read as a single piece of source — which is exactly what
 does internally. Recorded here because it's an easy trap to fall into
 again if extending this engine, not because it was ever a bug in the
 engine itself.
+
+## Garbage collection and the iterative solver
+
+Until this change memory was never given back while a program ran: a
+counting loop `count(N) :- N > 0, N1 is N - 1, count(N1).` used about
+100 KB per iteration (2,000 iterations 242 MB peak RSS, 6,000 iterations
+634 MB). Measuring the cREXX VM showed where it went:
+
+- **CREXX call frames.** `Solve` called itself for every goal (each
+  builtin ended in `return Solve(rest)`, each clause body was a nested
+  `Solve`), about seven frames per loop iteration. The VM does not free a
+  frame when a procedure returns; it keeps it, with its registers and
+  their string buffers, on a per-procedure free list
+  (`rxvmintp.c`, `free_frame`), so the high-water mark of recursion depth
+  stays allocated. A trivial recursive procedure costs ~4.4 KB per level;
+  `Solve`'s frames far more.
+- **`BIND`**, a `.stem` (a Level B hash map with 256 buckets and no
+  delete): every variable ever bound keeps an entry (~0.6 KB), and every
+  lookup walks a chain of length entries/256, so it also gets slower.
+- **`TRAIL`**, one entry per binding not undone by backtracking.
+- **Retracted clauses** (`CLHEAD`/`CLBODY` entries were never removed).
+
+Strings themselves are freed by the VM as soon as nothing holds them, and
+assigning a new `.stem()` to a global frees the old one (measured), so
+terms need no collector of their own.
+
+**Solver.** `Solve` is now a loop with one step procedure (`SolveStep`).
+A goal that leaves nothing to come back to (builtins, `,`, `call/N`,
+`true`, the Then/Else of an if-then-else, the right branch of `;`, and
+the last clause of a predicate that can still match the call) replaces
+the goal list and the loop goes round. Real choice points (a clause with
+later clauses that may still match; the left branch of `;`) and isolated
+sub-proofs (conditions, `\+`, `findall/3`) still nest. "May still match"
+compares the call's first argument with each later clause's first
+argument (precomputed at assert time: `CLFAK`/`CLFAV`/`CLFAN`), using the
+same comparisons `Unify` would.
+
+The frames that are no longer made had work to do when a failure passed
+back through them: undo the trail to their mark; for `$cut(B)`, set
+`CUTSIGNAL = B`; for a last clause, clear `CUTSIGNAL` if it is that
+activation's barrier, and otherwise go on renaming (and failing to
+match) the clauses the first-argument test skipped, which advances the
+renaming counter and so changes printed variable names later. Each
+`Solve` loop records this compactly: the oldest such trail mark
+(`GCRF[slot]`), and a small table (`GCRT[slot]`, the `FATab*`
+procedures) mapping the value of `CUTSIGNAL` at failure time to its final
+value plus the number of renaming steps to add, composed frame by frame.
+Entries for barriers that no pending `$cut` can name any more are pruned,
+so the table stays small. Results, output and variable names are
+identical to the recursive solver; `tests/34_gc_cutfail.pl` checks the
+failure cases (identical with the old CREXX version and the C version).
+
+**Collector** (`GCCollect`, section GARBAGE COLLECTOR in the source). A
+copying collector for `BIND`, with trail compaction and clause-store
+compaction. It runs only at the top of a `Solve` loop (or from `gc/0`,
+`)gc`), where all live data is reachable from:
+
+- the GC root stack: one slot per active `Solve` (its goal list whenever
+  it calls out — the goal, its continuation, and with it every
+  alternative the frames below still hold), plus a slot per running
+  `findall` (outer accumulators/templates), directive and top-level
+  query; slots also hold the trail marks of pending choice points and
+  sub-proofs and the clause-id snapshots being iterated;
+- `FINDALLACC`, `FINDALLTEMPLATE`, `QUERYVARMAP` (top-level query and
+  `PrologCall` variables, live during `more (;)?` and between API calls),
+  `APILASTMARK`;
+- variables in clauses added by `assert/1` that are still in the
+  database (`listing` dereferences list tails).
+
+Marking scans root strings for variable tags (`'02'x` up to the next
+delimiter, with `pos`/`verify`, so linear) and follows bindings; the
+marked bound variables go straight into the new `BIND` stem, which also
+serves as the mark set. A trail entry survives only if its variable is
+marked and some live mark lies below it; all registered marks are then
+renumbered (every holder reads its mark back from its slot after a
+nested call). Retracted clauses not in any slot's clause snapshot are
+dropped from the clause stems once 500 have accumulated. Variable names
+and counters are never changed.
+
+Automatic collection starts after max(5,000, live bindings after the
+last collection) new bindings (+ retracts). Switches: `gc(off)`,
+`gc(on)`, `gc(N)` stress mode (collect every N solver steps),
+`gc/0` (collect and report), `statistics/0`, `)gc`, and the environment
+variables `PROLOG_GC=off`, `PROLOG_GC_STRESS=N`, `PROLOG_GC_MIN=N`.
+
+**Tests.** `tests/34_gc_loops.pl`, `34_gc_db.pl`, `34_gc_backtrack.pl`
+(with `.in`: GC while the top level asks `more (;)?`) and
+`34_gc_cutfail.pl`; their expected output was produced with the C
+version and is identical with this one. The whole corpus (37 programs)
+passes normally, with `PROLOG_GC=off`, and in stress mode
+`PROLOG_GC_STRESS=1` (a collection before every goal; ~16 CPU minutes
+instead of ~3). `caller_example.crexx` gives the same output as before,
+also in stress mode, and a scratch API test (PrologCall, then
+PrologFindAll with collections, then PrologGetVar of the first call's
+variables, repeated calls) matched the old version.
+
+**Measurements** (peak RSS / CPU seconds; 2-core VM shared with other
+jobs, so CPU times are ±10 %; the VM plus compiled interpreter alone
+peak at ~62 MB):
+
+| Program | before | after | after, `PROLOG_GC=off` |
+|---|---|---|---|
+| count(2,000) | 242 MB / 2.0 s | 64 MB | |
+| count(4,000) | 437 MB / 3.4 s | | |
+| count(6,000) | 634 MB / 5.9 s | 64 MB / 4.7 s | |
+| count(10,000) | (~1 GB, estimated) | 64 MB / 6.7 s | 70 MB / 6.5 s |
+| count(100,000) | (~10 GB, estimated) | 64 MB / 63 s | 225 MB / 75 s |
+| bench/assertloop | 139 MB / 4.8 s | 65 MB / 5.0 s | 64 MB / 4.8 s |
+| bench/fib | 263 MB / 2.9 s | 107 MB / 2.9 s | 102 MB / 2.8 s |
+| bench/findall_big | 154 MB / 9.8 s | 65 MB / 10.4 s | 65 MB / 10.6 s |
+| bench/nqueens | 80 MB / 14.0 s | 65 MB / 13.6 s | 78 MB / 13.5 s |
+| bench/nrev | 456 MB / 13.5 s | 65 MB / 12.6 s | 93 MB / 13.1 s |
+| bench/primes | 81 MB / 2.5 s | 65 MB / 2.4 s | 65 MB / 2.6 s |
+| bench/zebra | 83 MB / 21.9 s | 65 MB / 21.3 s | 83 MB / 23.3 s |
+
+Benchmark output checksums are unchanged. The collector costs nothing
+measurable on programs that do not need it (the GC-off column), and
+speeds up long runs because the `BIND` hash chains stay short.
+
+**Limits.** Memory still grows with what is really live: open choice
+points (each still a nested CREXX `Solve` call — `fib.pl` leaves one per
+`fib(1, _)` call because its last clause has a variable first argument),
+non-tail recursion (pending goals in the continuation), long variable
+chains reachable from a query variable, and the database. Only the first
+argument is used to decide that a clause is the last that can match.
+A collection briefly needs room for the old and the new `BIND` stem.
+Stem entries stay expensive (~0.6 KB, slower lookups as they grow), so
+programs with large live data are still slow; replacing `BIND` with a
+native map would be the next step.

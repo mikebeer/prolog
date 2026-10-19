@@ -1,0 +1,23 @@
+f(_Q_145#19)
+no
+g(_Z_151#28)
+no
+h(_Z_158#54)
+[zero,alt(1),alt(2),alt(3)]
+i(_Z_167#75)
+v5no
+v2yes
+j(_Z_172#96)
+w_failed
+k(_Z_179#112)
+1275
+l(_Z_187#317)
+noy4
+m(_Z_192#327)
+noz3
+n(_Z_198#338)
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+
+goodbye.

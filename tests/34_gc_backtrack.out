@@ -1,0 +1,14 @@
+fail_loop_done
+2686700
+b
+[left,right]
+neg_ok
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+X = a, V = g(_V_160#34413#40416)
+     more (;)? X = b, V = g(_V_160#34413#43422)
+     more (;)? X = c, V = g(_V_160#34413#46428)
+     more (;)? ?-
+
+goodbye.

@@ -520,6 +520,9 @@ commands, not Prolog goals, and never end in `.` or `?`.
 | `)lib` | List `.pl` files in the current directory, ready to `consult` |
 | `)lib dir` | ...or in a given directory instead |
 | `)clear` | Wipe the database back to a fresh session (built-in library reloaded, your own data gone) |
+| `)gc` | Run the garbage collector now and report what it freed (see [§5.8](#58-memory-and-garbage-collection)) |
+| `)gc stats` | Show the memory counters (same as `statistics?`) |
+| `)gc on`, `)gc off`, `)gc N` | Switch automatic garbage collection on or off, or to stress mode (collect every N steps; `)gc 0` is normal) |
 | `)help` or `)?` | Show a summary of session commands and the `.`/`?` convention |
 | `)quit` or `)exit` | End the session |
 
@@ -718,6 +721,60 @@ for the full explanation and how to add your own callbacks.
 | `crexx_call(Name, Result)` | Call the CREXX function registered under Name (in `crexxcallback.crexx`) with no argument |
 | `crexx_call(Name, ArgText, Result)` | ...or with one argument |
 
+### 5.8 Memory and garbage collection
+
+Memory is reclaimed while a program runs, so a long **deterministic**
+loop (one that leaves no choice point behind) runs in bounded memory —
+for example `count(0) :- !.  count(N) :- N > 0, N1 is N - 1, count(N1).`
+runs for any N in about the same memory as `count(10)`. Earlier
+versions used about 100 KB per iteration and gave out after a few
+thousand.
+
+Two things make this work:
+
+- **The solver is a loop.** A goal that leaves nothing to come back to
+  — a built-in, `,`, `call/N`, the chosen branch of an if-then-else,
+  the second branch of `;`, and the *last clause that can still match*
+  a call — simply replaces the current goal list. Only a real choice
+  point (a clause with later clauses that might also match, the first
+  branch of `;`) or a sub-proof run in isolation (an if-then-else
+  condition, `\+`, `findall/3`) nests. "Can still match" looks at the
+  first argument: for `down(N) :- N > 0, ..., down(N1).  down(0).`, a
+  call `down(5)` cannot match `down(0)`, so no choice point remains.
+- **A garbage collector** removes variable bindings, trail entries and
+  retracted clauses that nothing can reach any more. It starts by
+  itself after a number of new bindings (5,000, or as many as survived
+  the last collection if that is more). It only runs at a point where
+  everything still in use can be found: the goals still to be proved
+  (including every alternative still to be tried), the variables of
+  the question being answered (also while `more (;)?` is asked),
+  `findall/3` results being collected, and clauses added with
+  `assert`. A retracted clause stays until no running call can still
+  be iterating over it (a call keeps seeing the clauses that existed
+  when it started).
+
+Answers, printed output and printed variable names (`_G12`,
+`_X_3#17`) are exactly the same with or without the collector.
+
+| Goal / switch | Meaning |
+|---|---|
+| `gc` | Collect now and print one line: live bindings, bindings freed, trail size before → after, retracted clauses freed |
+| `statistics` | Print the counters: collections, stored and freed bindings, trail entries, stored and freed clauses |
+| `gc(off)`, `gc(on)` | Switch automatic collection off / back on |
+| `gc(N)` | Stress mode: collect every N solver steps (`gc(1)` is every step; `gc(0)` returns to normal) — for testing |
+| `)gc`, `)gc stats`, `)gc on/off/N` | The same from the session prompt |
+| `PROLOG_GC=off` | Environment variable: start with automatic collection off |
+| `PROLOG_GC_STRESS=N` | Environment variable: start in stress mode, e.g. `PROLOG_GC_STRESS=1 sh tests/run_tests_crexx.sh` |
+| `PROLOG_GC_MIN=N` | Environment variable: new bindings before the first automatic collection (default 5000) |
+
+Limits: memory still grows with what a program really keeps — choice
+points left open, long lists, a growing database, a recursion that is
+not the last goal of its clause (such as `len([_|T], N) :- len(T, M),
+N is M + 1`, whose pending `N is M + 1` goals are needed). Only the
+first argument is looked at when deciding whether a clause is the last
+one that can match. The interpreter itself (the CREXX VM and the
+compiled program) takes about 60 MB before any Prolog runs.
+
 ---
 
 ## 6. Known Limitations
@@ -831,6 +888,7 @@ cut example.
 - **exclude/3** — [§5.5](#55-bootstrap-library-predicates)
 - **facts** — [§1](#1-introduction-to-prolog), [§2](#2-getting-started)
 - **findall/3** — [§3.1](#31-a-family-tree--facts-rules-backtracking), [§5.4](#54-built-in-predicates)
+- **garbage collection, `gc/0`, `gc/1`, `)gc`** — [§5.1](#51-session-commands), [§5.8](#58-memory-and-garbage-collection)
 - **forall/2** — [§5.5](#55-bootstrap-library-predicates)
 - **functor/3** — [§5.4](#54-built-in-predicates)
 - **ground/1** — [§5.4](#54-built-in-predicates)
@@ -868,6 +926,7 @@ cut example.
 - **setof/3** (not supported) — [§6](#6-known-limitations)
 - **sort/2** — [§3.3](#33-arithmetic-and-list-processing), [§5.5](#55-bootstrap-library-predicates)
 - **standard order of terms (`@<` etc.)** — [§5.4](#54-built-in-predicates)
+- **statistics/0** — [§5.8](#58-memory-and-garbage-collection)
 - **strings (double-quoted)** — [§4](#4-language-reference)
 - **sum_list/2** — [§3.3](#33-arithmetic-and-list-processing), [§5.5](#55-bootstrap-library-predicates)
 - **terminator convention (`.` vs `?`)** — [§2](#2-getting-started), [§7](#7-troubleshooting-and-tips)

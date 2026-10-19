@@ -26,9 +26,19 @@ is in `crexx-dist/` (with its Prolog source-buffer API and RXPP samples).
 
 `c/` holds a strict C89 port of the interpreter with the same top level and
 error messages (see `c/README.md`, and `c/PORTING.md` for VM/370). The shared
-regression corpus is in `tests/` (33 programs, `NAME.pl`, `NAME.in`, `NAME.out`);
+regression corpus is in `tests/` (36 programs, `NAME.pl`, `NAME.in`, `NAME.out`);
 both versions must pass it:
 
     sh tests/run_tests_crexx.sh         # CREXX version (CREXX_VM=path/to/crexx)
     cd c && make test                   # C version
     sh bench/run.sh --crexx; sh bench/run.sh c/prolog   # benchmarks, same checksums
+    PROLOG_GC_STRESS=1 sh tests/run_tests_crexx.sh      # CREXX, collecting garbage every step
+
+## Memory
+
+The CREXX version reclaims memory while it runs: the solver no longer nests a
+CREXX call per goal, and a garbage collector removes dead variable bindings,
+trail entries and retracted clauses, so long deterministic loops run in bounded
+memory. See `MANUAL.md` section 5.8 (switches `gc/0`, `gc/1`, `statistics/0`,
+`)gc`, `PROLOG_GC*` environment variables) and `PORT_NOTES.md` (design,
+measurements).

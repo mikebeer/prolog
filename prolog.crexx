@@ -311,6 +311,7 @@ InitEngine: procedure = .void expose TOK QUERYVARMAP LASTTERMCHAR CLCOUNTER BOOT
   call InitOps
   call InitParser
   call InitBindings
+  call InitGC
   call InitDB
   call InitSolver
   call InitBuiltins
@@ -434,7 +435,7 @@ PrologConsultString: procedure = .void expose TOK APIREADY
   return
 
 PrologFindAll: procedure = .string expose TOK PPOS PVARMAP APIFINDALLRESULTS,
-                                          SOLVEMODE FINDALLACC FINDALLTEMPLATE
+                                          SOLVEMODE FINDALLACC FINDALLTEMPLATE GCRM
   arg goalText = .string, templateVarName = .string
   call InitApiOnce
   txt = strip(goalText)
@@ -454,9 +455,11 @@ PrologFindAll: procedure = .string expose TOK PPOS PVARMAP APIFINDALLRESULTS,
   SOLVEMODE = 'FINDALL'
   FINDALLACC = GLEmpty()
   FINDALLTEMPLATE = tmplref
-  mark = TrailMark()
+  slot = GCPushSlot(GLConcat(savedacc, savedtmpl))
+  GCRM[slot] = TrailMark()
   call Solve GLAppend(GLEmpty(), goal)
-  call TrailUndo mark
+  call TrailUndo GCRM[slot]
+  call GCPopSlot slot
   results = FINDALLACC
   SOLVEMODE = savedmode
   FINDALLACC = savedacc
@@ -1400,16 +1403,27 @@ WTNeedsQuote: procedure = .string
    of clause ids for that predicate -- assert/z appends, asserta
    prepends, retract removes one id from the list (there is no stem
    delete, so as in apl.crexx's SysErase, "remove" means rebuild the
-   id list without that entry; the CLHEAD/CLBODY entries themselves are
-   just left as harmless garbage, since nothing ever looks them up
-   except by walking the id list).
+   id list without that entry; the CLHEAD/CLBODY entries themselves
+   stay until the garbage collector finds that no running call is
+   still iterating over a clause list that contains them -- see
+   GCCompactDB). CLSTORED counts the clauses held in the stems.
    ====================================================================== */
-InitDB: procedure = .void expose CLHEAD CLBODY PRED PREDLIST CLCOUNTER
+InitDB: procedure = .void expose CLHEAD CLBODY PRED PREDLIST CLCOUNTER,
+                                 CLHNV CLFAK CLFAV CLFAN CLVARS CLDEAD RTIDS CLSTORED GCDEAD
   CLHEAD = .stem()
   CLBODY = .stem()
   PRED = .stem()
   PREDLIST = ''
   CLCOUNTER = 0
+  CLHNV = .stem()
+  CLFAK = .stem()
+  CLFAV = .stem()
+  CLFAN = .stem()
+  CLVARS = .stem()
+  CLDEAD = .stem()
+  RTIDS = ''
+  CLSTORED = 0
+  GCDEAD = 0
   return
 
 PredKey: procedure = .string
@@ -1418,7 +1432,7 @@ PredKey: procedure = .string
 
 /* AssertClause: term is either a bare fact (Head) or a rule
    Head:-Body. atz='1' appends (assert/assertz), '0' prepends (asserta). */
-AssertClause: procedure = .void expose CLHEAD CLBODY PRED PREDLIST CLCOUNTER
+AssertClause: procedure = .void expose CLHEAD CLBODY PRED PREDLIST CLCOUNTER CLSTORED
   arg term = .string, atz = .string
   head = term
   body = GLEmpty()
@@ -1431,9 +1445,33 @@ AssertClause: procedure = .void expose CLHEAD CLBODY PRED PREDLIST CLCOUNTER
   id = CLCOUNTER
   CLHEAD[id] = head
   CLBODY[id] = body
+  CLSTORED = CLSTORED + 1
+  call IndexClause id, head
   if PRED[key] = '' & wordpos(key, PREDLIST) = 0 then PREDLIST = PREDLIST key
   if atz = '1' then PRED[key] = GLAppend(PRED[key], id)
   else PRED[key] = GLPrepend(id, PRED[key])
+  return
+
+/* IndexClause: what the solver's last-clause test needs to know about
+   a clause head without renaming it: CLHNV, the number of distinct
+   variables (renaming steps it uses up), and CLFAK/CLFAV/CLFAN, its
+   first argument: 'V' (a variable, or no argument), 'A' + the atomic,
+   or 'C' + functor + arity */
+IndexClause: procedure = .void expose CLHNV CLFAK CLFAV CLFAN
+  arg id = .string, head = .string
+  CLHNV[id] = words(VarNamesOf(head))
+  CLFAK[id] = 'V'
+  if IsCompound(head) \= '1' then return
+  a = ArgN(head, 1)
+  if IsVar(a) = '1' then return
+  if IsCompound(a) = '1' then do
+    CLFAK[id] = 'C'
+    CLFAV[id] = Functor(a)
+    CLFAN[id] = Arity(a)
+    return
+  end
+  CLFAK[id] = 'A'
+  CLFAV[id] = a
   return
 
 /* FlattenConj: turns a ','/2-nested body term into a goal list (see
@@ -1460,6 +1498,7 @@ RetractClause: procedure = .string expose CLHEAD CLBODY PRED
     rbody = FlattenToConjTerm(RenameGoalList(CLBODY[id]))
     if Unify(headpat, rhead) = '1' & Unify(bodypat, rbody) = '1' then do
       PRED[key] = RemoveWordFromGL(ids, id)
+      call GCNoteRetract id
       return '1'
     end
     call TrailUndo mark
@@ -1581,17 +1620,94 @@ OnSolution: procedure = .string expose SOLVEMODE FINDALLACC FINDALLTEMPLATE
   end
   return '1'
 
-/* Solve: the resolution engine's core loop. */
-Solve: procedure = .string expose CLHEAD CLBODY PRED CUTSIGNAL
+/* Solve: the resolution engine's core loop.
+   Solve(goals) used to call itself for every goal it proved (each
+   builtin, each clause body and each continuation was a new CREXX call),
+   so a deterministic loop of N iterations nested ~7N CREXX frames, and
+   the VM keeps every frame it ever used on a per-procedure free list.
+   It is now a loop: a goal that leaves nothing to come back to (a
+   builtin, a conjunction, call/N, the Then/Else of an if-then-else,
+   the right-hand side of a disjunction, and the last clause that can
+   match a user predicate call) just replaces the goal list and goes
+   round again. Only a real choice point (a clause with later clauses
+   that might still match, the left side of a disjunction) or a
+   sub-proof run in isolation (if-then-else conditions, \+, findall)
+   still makes a nested Solve call.
+   What the frames that are no longer made would have done on the way
+   back out after a failure (undo the trail to their mark; for $cut(B),
+   set CUTSIGNAL = B; for a last clause, clear CUTSIGNAL if it names
+   that activation's barrier, otherwise keep renaming the clauses that
+   were skipped because their first argument cannot match) is recorded
+   in this activation's GC root-stack slot: GCRF[slot] is the oldest
+   such trail mark (undoing to it undoes everything the frames would
+   have undone) and GCRT[slot] is a small table that maps the value of
+   CUTSIGNAL at failure time to its final value plus the number of
+   renaming counter steps the skipped clauses would have used (see the
+   FATab* procedures). Entries for barriers that can no longer be named
+   by a pending $cut are dropped, so the table stays small however long
+   the loop runs. Results, printed answers and variable names are the
+   same as with the old fully recursive solver.
+   Every Solve activation owns a slot on the GC root stack (GCRG: its
+   goal list whenever it calls out; GCRM: the trail mark of a pending
+   choice point; GCRI: the clause-id snapshot it is iterating). The top
+   of the loop is the garbage collector's safe point (see GARBAGE
+   COLLECTOR below). */
+Solve: procedure = .string expose GCALLOC GCNEXT GCSTRESS GCSTEPS GCRG NEXTGOALS
   arg goals = .string
-  if GLCount(goals) = 0 then return OnSolution()
+  slot = GCPushSlot(goals)
+  act = 'F'
+  do forever
+    if GCSTRESS > 0 then do
+      GCSTEPS = GCSTEPS + 1
+      if GCSTEPS >= GCSTRESS then do
+        GCRG[slot] = goals
+        call GCCollect 'A'
+      end
+    end
+    else if GCALLOC >= GCNEXT then do
+      GCRG[slot] = goals
+      call GCCollect 'A'
+    end
+    if GLCount(goals) = 0 then do
+      act = 'F'
+      if OnSolution() = '1' then act = 'S'
+      leave
+    end
+    act = SolveStep(slot, goals)
+    if act \= 'C' then leave
+    goals = NEXTGOALS
+  end
+  if act = 'S' then do
+    call GCPopSlot slot
+    return '1'
+  end
+  call SolveFailExit slot
+  call GCPopSlot slot
+  return '0'
 
+/* SolveFailExit: what the eliminated frames would have done while the
+   failure travelled back out of them (see Solve above). */
+SolveFailExit: procedure = .void expose CUTSIGNAL RVARCOUNTER GCRF GCRT
+  arg slot = .string
+  res = FATabEval(GCRT[slot], CUTSIGNAL)
+  parse var res o d
+  if o = '-' then CUTSIGNAL = ''
+  else CUTSIGNAL = o
+  if d > 0 then RVARCOUNTER = RVARCOUNTER + d
+  if GCRF[slot] \= '' then call TrailUndo GCRF[slot]
+  return
+
+/* SolveStep: proves the first goal of goals. Returns 'C' (continue with
+   the goal list left in NEXTGOALS), 'S' (a nested proof reached a
+   solution that stops the search) or 'F' (fail). */
+SolveStep: procedure = .string expose CUTSIGNAL NEXTGOALS GCRG
+  arg slot = .string, goals = .string
   goal = Deref(GLFirst(goals))
   rest = GLRest(goals)
 
   if IsVar(goal) = '1' then do
     say 'prolog: instantiation error (unbound goal)'
-    return '0'
+    return 'F'
   end
 
   fn = Functor(goal)
@@ -1599,37 +1715,57 @@ Solve: procedure = .string expose CLHEAD CLBODY PRED CUTSIGNAL
 
   /* --- control constructs -------------------------------------- */
   if fn = ',' & ar = 2 then do
-    newgoals = GLAppend(GLAppend(GLEmpty(), ArgN(goal,1)), ArgN(goal,2))
-    return Solve(GLConcat(newgoals, rest))
+    NEXTGOALS = GLConcat(GLAppend(GLAppend(GLEmpty(), ArgN(goal,1)), ArgN(goal,2)), rest)
+    return 'C'
+  end
+  if fn = 'true' & ar = 0 then do
+    NEXTGOALS = rest
+    return 'C'
+  end
+  if fn = 'fail' & ar = 0 then return 'F'
+  if fn = 'false' & ar = 0 then return 'F'
+
+  /* a bare ! with no barrier context (e.g. typed directly at the top
+     level) just succeeds like true/0 -- there is no enclosing clause
+     choice point to cut */
+  if fn = '!' & ar = 0 then do
+    NEXTGOALS = rest
+    return 'C'
   end
 
-  if fn = 'true' & ar = 0 then return Solve(rest)
-  if fn = 'fail' & ar = 0 then return '0'
-  if fn = 'false' & ar = 0 then return '0'
+  if fn = '$cut' & ar = 1 then do
+    call FATabSet slot, ArgN(goal,1)
+    NEXTGOALS = rest
+    return 'C'
+  end
 
-  if fn = '!' & ar = 0 then return Solve(rest)   /* a bare ! with no
-    barrier context (e.g. typed directly at the top level) just
-    succeeds like true/0 -- there is no enclosing clause choice point
-    to cut */
+  if fn = ';' & ar = 2 then return SolveDisjunction(slot, goals, goal, rest)
+  if fn = '->' & ar = 2 then return SolveIfThenNoElse(slot, goals, goal, rest)
+  if fn = '\+' & ar = 1 then return SolveNegation(slot, goals, ArgN(goal,1), rest)
+  if fn = 'not' & ar = 1 then return SolveNegation(slot, goals, ArgN(goal,1), rest)
 
-  if fn = '$cut' & ar = 1 then return SolveCut(ArgN(goal,1), rest)
-
-  if fn = ';' & ar = 2 then return SolveDisjunction(goal, rest)
-
-  if fn = '->' & ar = 2 then return SolveIfThenNoElse(goal, rest)
-
-  if fn = '\+' & ar = 1 then return SolveNegation(ArgN(goal,1), rest)
-
-  if fn = 'not' & ar = 1 then return SolveNegation(ArgN(goal,1), rest)
-
-  if fn = 'call' & ar >= 1 then return Solve(GLPrepend(BuildCallGoal(goal), rest))
+  if fn = 'call' & ar >= 1 then do
+    NEXTGOALS = GLPrepend(BuildCallGoal(goal), rest)
+    return 'C'
+  end
 
   /* --- built-ins (arithmetic, comparison, type tests, lists, I/O,
-     database, findall, etc.) -- see the BUILT-INS section */
-  if IsBuiltin(fn, ar) = '1' then return SolveBuiltin(fn, ar, goal, rest)
+     database, findall, etc.) -- see the BUILT-INS section; '1' means
+     "succeeded, continue with rest" */
+  if IsBuiltin(fn, ar) = '1' then do
+    /* findall, consult/load (directives), gc and crexx_call (which may
+       call back into the API) can reach a GC safe point */
+    if fn = 'findall' | fn = 'consult' | fn = 'load' | fn = 'gc' | fn = 'crexx_call' then
+      GCRG[slot] = goals
+    if SolveBuiltin(fn, ar, goal, rest) = '1' then do
+      NEXTGOALS = rest
+      return 'C'
+    end
+    return 'F'
+  end
 
   /* --- user predicate: try each clause in turn ------------------ */
-  return SolveUserPredicate(fn, ar, goal, rest)
+  return SolveUserPredicate(slot, goals, fn, ar, goal, rest)
 
 /* BuildCallGoal: call(G, A1, A2, ...) -- deref G and append the extra
    arguments A1.. to it (extending its own argument list), the
@@ -1650,68 +1786,84 @@ BuildCallGoal: procedure = .string
   end
   return MkCompound(fn, args)
 
-SolveCut: procedure = .string expose CUTSIGNAL
-  arg barrierid = .string, rest = .string
-  ok = Solve(rest)
-  if ok = '1' then return '1'
-  CUTSIGNAL = barrierid
-  return '0'
-
 /* SolveDisjunction: (A ; B) -- if A is itself (Cond -> Then), this is
-   full if-then-else; otherwise plain "try A, then try B" */
-SolveDisjunction: procedure = .string
-  arg goal = .string, rest = .string
+   full if-then-else; otherwise plain "try A, then try B" (A is a real
+   choice point: a nested proof; B continues in the caller's loop) */
+SolveDisjunction: procedure = .string expose NEXTGOALS GCRG GCRM
+  arg slot = .string, goals = .string, goal = .string, rest = .string
   left = ArgN(goal, 1)
   right = ArgN(goal, 2)
   if IsCompound(left) = '1' & Functor(left) = '->' & Arity(left) = 2 then
-    return SolveIfThenElse(ArgN(left,1), ArgN(left,2), right, rest)
-  mark = TrailMark()
-  if Solve(GLPrepend(left, rest)) = '1' then return '1'
-  call TrailUndo mark
-  return Solve(GLPrepend(right, rest))
+    return SolveIfThenElse(slot, goals, ArgN(left,1), ArgN(left,2), right, rest)
+  GCRG[slot] = goals
+  GCRM[slot] = TrailMark()
+  if Solve(GLPrepend(left, rest)) = '1' then do
+    GCRM[slot] = ''
+    return 'S'
+  end
+  call TrailUndo GCRM[slot]
+  GCRM[slot] = ''
+  NEXTGOALS = GLPrepend(right, rest)
+  return 'C'
 
 /* SolveIfThenElse: (Cond -> Then ; Else), rest is what follows.
    Commits to Cond's FIRST solution only (isolated via a saved/
    restored SOLVEMODE='FIRST', regardless of the ambient mode -- see
    the header comment on SOLVEMODE). */
-SolveIfThenElse: procedure = .string expose SOLVEMODE
-  arg cond = .string, thengoal = .string, elsegoal = .string, rest = .string
-  mark = TrailMark()
+SolveIfThenElse: procedure = .string expose SOLVEMODE NEXTGOALS GCRG GCRM
+  arg slot = .string, goals = .string, cond = .string, thengoal = .string, elsegoal = .string, rest = .string
+  GCRG[slot] = goals
+  GCRM[slot] = TrailMark()
   savedmode = SOLVEMODE
   SOLVEMODE = 'FIRST'
   found = Solve(GLAppend(GLEmpty(), cond))
   SOLVEMODE = savedmode
-  if found = '1' then return Solve(GLPrepend(thengoal, rest))
-  call TrailUndo mark
-  return Solve(GLPrepend(elsegoal, rest))
+  if found = '1' then do
+    GCRM[slot] = ''
+    NEXTGOALS = GLPrepend(thengoal, rest)
+    return 'C'
+  end
+  call TrailUndo GCRM[slot]
+  GCRM[slot] = ''
+  NEXTGOALS = GLPrepend(elsegoal, rest)
+  return 'C'
 
 /* SolveIfThenNoElse: bare (Cond -> Then) with no ';' -- fails outright
    if Cond has no solution */
-SolveIfThenNoElse: procedure = .string expose SOLVEMODE
-  arg goal = .string, rest = .string
+SolveIfThenNoElse: procedure = .string expose SOLVEMODE NEXTGOALS GCRG GCRM
+  arg slot = .string, goals = .string, goal = .string, rest = .string
   cond = ArgN(goal, 1)
   thengoal = ArgN(goal, 2)
-  mark = TrailMark()
+  GCRG[slot] = goals
+  GCRM[slot] = TrailMark()
   savedmode = SOLVEMODE
   SOLVEMODE = 'FIRST'
   found = Solve(GLAppend(GLEmpty(), cond))
   SOLVEMODE = savedmode
-  if found = '1' then return Solve(GLPrepend(thengoal, rest))
-  call TrailUndo mark
-  return '0'
+  if found = '1' then do
+    GCRM[slot] = ''
+    NEXTGOALS = GLPrepend(thengoal, rest)
+    return 'C'
+  end
+  call TrailUndo GCRM[slot]
+  GCRM[slot] = ''
+  return 'F'
 
 /* SolveNegation: \+ Goal -- succeeds (continuing with rest) iff Goal
    has NO solution; never keeps any of Goal's bindings either way */
-SolveNegation: procedure = .string expose SOLVEMODE
-  arg goal = .string, rest = .string
-  mark = TrailMark()
+SolveNegation: procedure = .string expose SOLVEMODE NEXTGOALS GCRG GCRM
+  arg slot = .string, goals = .string, goal = .string, rest = .string
+  GCRG[slot] = goals
+  GCRM[slot] = TrailMark()
   savedmode = SOLVEMODE
   SOLVEMODE = 'FIRST'
   found = Solve(GLAppend(GLEmpty(), goal))
   SOLVEMODE = savedmode
-  call TrailUndo mark
-  if found = '1' then return '0'
-  return Solve(rest)
+  call TrailUndo GCRM[slot]
+  GCRM[slot] = ''
+  if found = '1' then return 'F'
+  NEXTGOALS = rest
+  return 'C'
 
 /* SolveOnce: solves goal for exactly one solution, in isolation,
    KEEPING its bindings on success (unlike \+, which always undoes
@@ -1727,20 +1879,25 @@ SolveOnce: procedure = .string expose SOLVEMODE
 
 /* SolveUserPredicate: the clause-selection loop for a user-defined
    predicate goal -- tries each clause of fn/ar in turn (in database
-   order), with its own fresh cut barrier. */
-SolveUserPredicate: procedure = .string expose CLHEAD CLBODY PRED CUTSIGNAL
-  arg fn = .string, ar = .string, goal = .string, rest = .string
+   order), with its own fresh cut barrier. A clause whose head unifies
+   and after which no later clause can match (by the first-argument
+   test in ClauseMayMatch) is entered in the caller's loop ('C'); any
+   other is a choice point, proved by a nested Solve. */
+SolveUserPredicate: procedure = .string expose CLHEAD CLBODY PRED CUTSIGNAL NEXTGOALS GCRG GCRM GCRI GCRF
+  arg slot = .string, goals = .string, fn = .string, ar = .string, goal = .string, rest = .string
   key = PredKey(fn, ar)
   ids = PRED[key]
-  if GLCount(ids) = 0 then do
+  n = GLCount(ids)
+  if n = 0 then do
     if IsKnownPredicate(fn, ar) \= '1' then do
       say 'prolog: unknown procedure' fn || '/' || ar
     end
-    return '0'
+    return 'F'
   end
   barrierid = NewBarrierId()
-  do i = 1 to GLCount(ids)
-    id = GLNth(ids, i)
+  fainfo = CallFirstArgInfo(goal, ar)
+  do i = 1 to n
+    id = word(ids, i)
     mark = TrailMark()
     call RenameFreshStart
     rhead = RenameTerm(CLHEAD[id])
@@ -1750,15 +1907,144 @@ SolveUserPredicate: procedure = .string expose CLHEAD CLBODY PRED CUTSIGNAL
       do bi = 1 to GLCount(rbody)
         cutbody = GLAppend(cutbody, SubstCutInGoal(GLNth(rbody, bi), barrierid))
       end
-      if Solve(GLConcat(cutbody, rest)) = '1' then return '1'
+      skiph = LaterClausesSkip(ids, i, n, fainfo)
+      if skiph >= 0 then do
+        NEXTGOALS = GLConcat(cutbody, rest)
+        call FATabClr slot, barrierid, skiph, NEXTGOALS
+        if GCRF[slot] = '' then GCRF[slot] = mark
+        return 'C'
+      end
+      GCRG[slot] = goals
+      GCRI[slot] = ids
+      GCRM[slot] = mark
+      if Solve(GLConcat(cutbody, rest)) = '1' then do
+        GCRM[slot] = ''
+        GCRI[slot] = ''
+        return 'S'
+      end
+      call TrailUndo GCRM[slot]
+      GCRM[slot] = ''
+      GCRI[slot] = ''
     end
-    call TrailUndo mark
+    else call TrailUndo mark
     if CUTSIGNAL \= '' then do
       if CUTSIGNAL = barrierid then CUTSIGNAL = ''
-      return '0'
+      return 'F'
     end
   end
-  return '0'
+  return 'F'
+
+/* CallFirstArgInfo: the first argument of a call, as the clause index
+   sees it: 'V' (no first argument, or an unbound one: every clause may
+   match), 'C' functor arity (a compound) or 'A' text (an atomic) */
+CallFirstArgInfo: procedure = .string
+  arg goal = .string, ar = .string
+  if ar < 1 then return 'V'
+  a = Deref(ArgN(goal, 1))
+  if IsVar(a) = '1' then return 'V'
+  if IsCompound(a) = '1' then return 'C' Functor(a) Arity(a)
+  return 'A' a
+
+/* LaterClausesSkip: -1 if some clause after the i-th in ids may still
+   match a call whose first argument is described by fainfo; otherwise
+   the number of distinct variables in the heads of those later clauses
+   (the renaming counter steps that trying -- and failing -- them would
+   have used). */
+LaterClausesSkip: procedure = .string expose CLFAK CLFAV CLFAN CLHNV
+  arg ids = .string, i = .string, n = .string, fainfo = .string
+  if i >= n then return 0
+  if left(fainfo, 1) = 'V' then return -1
+  parse var fainfo kind fv fa
+  sum = 0
+  do j = i + 1 to n
+    id = word(ids, j)
+    ck = CLFAK[id]
+    if ck = 'V' then return -1
+    if ck = kind then do
+      if kind = 'A' then do
+        if CLFAV[id] = fv then return -1
+      end
+      else do
+        if CLFAV[id] = fv & CLFAN[id] = fa then return -1
+      end
+    end
+    sum = sum + CLHNV[id]
+  end
+  return sum
+
+/* ----------------------------------------------------------------------
+   FAILURE TABLE of an eliminated chain of frames (see Solve). A table is
+   a string of words "key:out:steps": key '-' (CUTSIGNAL is empty), '*'
+   (any other value) or a barrier id; out '-' (empty) or a barrier id;
+   a missing '*' entry means "unchanged"; steps is how many renaming counter
+   steps to add. A new frame is always the innermost one, so its
+   operation is applied BEFORE the table built so far.
+   ---------------------------------------------------------------------- */
+FATabEval: procedure = .string
+  arg tab = .string, s = .string
+  dflt = ''
+  do w = 1 to words(tab)
+    parse value word(tab, w) with ek ':' eo ':' ed
+    if s = '' then do
+      if ek = '-' then return eo ed
+    end
+    else do
+      if ek = '*' then dflt = eo ed
+      else if ek \= '-' then do
+        if ek = s then return eo ed
+      end
+    end
+  end
+  if s = '' then return '- 0'
+  if dflt \= '' then return dflt
+  return s 0
+
+/* FATabClr: a last-clause frame for barrier b whose failure goes on to
+   try later clauses that use up h renaming steps: S='' -> add h;
+   S=b -> S=''; anything else unchanged. goals is the new continuation
+   (used to prune the table, see FATabPrune). */
+FATabClr: procedure = .void expose GCRT CUTSIGNAL TCOMP TARGSEP TARGEND
+  arg slot = .string, b = .string, h = .string, goals = .string
+  tab = GCRT[slot]
+  e = FATabEval(tab, '')
+  parse var e eo ed
+  out = '-:' || eo || ':' || (ed + h) b || ':' || eo || ':' || ed
+  do w = 1 to words(tab)
+    item = word(tab, w)
+    if left(item, 2) \= '-:' then out = out item
+  end
+  if words(out) > 18 then out = FATabPrune(out, goals)
+  GCRT[slot] = out
+  return
+
+/* FATabSet: a $cut(c) frame: whatever happened further in, CUTSIGNAL
+   ends up as c -- the table collapses to one constant entry */
+FATabSet: procedure = .void expose GCRT
+  arg slot = .string, c = .string
+  e = FATabEval(GCRT[slot], c)
+  parse var e eo ed
+  GCRT[slot] = '-:' || eo || ':' || ed '*:' || eo || ':' || ed
+  return
+
+/* FATabPrune: drops the entries of barriers that can no longer be the
+   value of CUTSIGNAL when the failure comes: no $cut(b) is left in
+   the goal list and CUTSIGNAL is not b now. (The goal list is the
+   activation's whole continuation; older roots were built before b
+   existed.) */
+FATabPrune: procedure = .string expose CUTSIGNAL TCOMP TARGSEP TARGEND
+  arg tab = .string, goals = .string
+  out = ''
+  do w = 1 to words(tab)
+    item = word(tab, w)
+    parse var item ek ':' .
+    if ek \= '-' & ek \= '*' then do
+      if ek \= CUTSIGNAL then do
+        if pos(TCOMP || '$cut' || TARGSEP || ek || TARGEND, goals) = 0 then iterate
+      end
+    end
+    out = out item
+  end
+  return strip(out)
 
 /* IsKnownPredicate: has this fn/ar ever had a clause asserted (even if
    they've since all been retracted)? Used only to decide whether an
@@ -2066,17 +2352,19 @@ BootstrapLibText: procedure = .string
       || 'concat_atom([A|T], R) :- concat_atom(T, R0), atom_concat(A, R0, R).'
   return t
 
-ConsultString: procedure = .void expose TOK PPOS
+ConsultString: procedure = .void expose TOK PPOS GCRM
   arg text = .string
   call PTokenize text
   do while PPOS <= TOK[0]
     t = ParseClauseTerm()
     if t = '' then leave
     if IsCompound(t) = '1' & Functor(t) = ':-' & Arity(t) = 1 then do
-      mark = TrailMark()
+      slot = GCPushSlot(t)
+      GCRM[slot] = TrailMark()
       ok = SolveOnce(ArgN(t, 1))
       if ok \= '1' then say 'prolog: directive failed:' WriteTerm(t, 1)
-      call TrailUndo mark
+      call TrailUndo GCRM[slot]
+      call GCPopSlot slot
     end
     else call AssertClause t, '1'
   end
@@ -2234,10 +2522,26 @@ HandleSysCmd: procedure = .string
     when ucmd = ')CLEAR' then call ClearWorkspace
     when ucmd = ')LIB' then call SysLib strip(rest)
     when ucmd = ')HELP' | ucmd = ')?' then call SysHelp
+    when ucmd = ')GC' then call SysGC strip(rest)
     when ucmd = ')QUIT' | ucmd = ')EXIT' then return 'QUIT'
     otherwise say 'prolog: unknown session command:' cmd '(try )help)'
   end
   return ''
+
+SysGC: procedure = .void
+  arg opt = .string
+  if opt = '' then do
+    call GCCollect 'F'
+    call GCReportLast
+    return
+  end
+  if translate(opt) = 'STATS' then do
+    call GCStatistics
+    return
+  end
+  if GCSwitch(opt) \= '1' then say 'prolog: )gc -- expected on, off, stats or a number'
+  else call GCStatistics
+  return
 
 SysHelp: procedure = .void
   say 'session commands:'
@@ -2332,15 +2636,17 @@ IsReservedTopLevelName: procedure = .string
 
 /* SolveInteractAndShow: solves g in INTERACT mode (bindings shown,
    "more (;)?" asked after each solution -- see InteractOnSolution). */
-SolveInteractAndShow: procedure = .void expose QUERYVARMAP PVARMAP SOLVEMODE
+SolveInteractAndShow: procedure = .void expose QUERYVARMAP PVARMAP SOLVEMODE GCRM
   arg g = .string
   QUERYVARMAP = PVARMAP
   SOLVEMODE = 'INTERACT'
-  mark = TrailMark()
+  slot = GCPushSlot('')
+  GCRM[slot] = TrailMark()
   ok = Solve(GLAppend(GLEmpty(), g))
   SOLVEMODE = 'FIRST'
   if ok \= '1' then say 'false.'
-  call TrailUndo mark
+  call TrailUndo GCRM[slot]
+  call GCPopSlot slot
   return
 
 RunTopLevel: procedure = .void expose TOK PPOS PVARMAP QUERYVARMAP SOLVEMODE LASTTERMCHAR
@@ -2475,10 +2781,11 @@ TrailUndo: procedure = .void expose TRAIL BIND
 
 /* BindVar: binds unbound variable (its internal name, already stripped
    of the tag byte) to value, and records it on the trail */
-BindVar: procedure = .void expose BIND TRAIL
+BindVar: procedure = .void expose BIND TRAIL GCALLOC
   arg vn = .string, value = .string
   BIND[vn] = value
   call arrayappend TRAIL, vn
+  GCALLOC = GCALLOC + 1
   return
 
 /* Unify: the core unification algorithm. On failure, any bindings it
@@ -2553,6 +2860,438 @@ RenameTerm: procedure = .string expose RVARMAP RVARCOUNTER
   return MkCompound(fn, args)
 
 /* ======================================================================
+   GARBAGE COLLECTOR
+   ----------------------------------------------------------------------
+   Terms are strings, so the CREXX VM frees a term as soon as no CREXX
+   variable holds it. What does NOT go away by itself:
+     - BIND, the stem of variable bindings: every variable ever bound
+       keeps its entry (a stem has no delete; undoing a binding only
+       sets it to ''), ~0.6 KB each, and every lookup walks a hash chain
+       of length entries/256, so it also gets slower as it grows;
+     - TRAIL, one entry per binding not undone by backtracking;
+     - CLHEAD/CLBODY (and the per-clause index data) of retracted
+       clauses, kept because a running call may still be iterating
+       over a snapshot of its predicate's clause list.
+   (The fourth source of growth, one CREXX frame per goal proved, is
+   gone since Solve became a loop -- see Solve.)
+   GCCollect is a copying collector for those structures. It runs only
+   at the top of a Solve loop, or from gc/0 and )gc, where every live
+   term is reachable from these roots:
+     - the GC root stack: one slot per active Solve (its goal list --
+       the goal it is working on plus its whole continuation, which
+       also holds every alternative still to be tried by the frames
+       below it, as Prolog has no other way to reach a term) and one
+       per findall/directive/top-level query in progress (outer
+       findall accumulators and templates);
+     - FINDALLACC / FINDALLTEMPLATE, QUERYVARMAP (the top-level query's
+       or PrologCall's variables, live while "more (;)?" is asked);
+     - variables inside clauses added by assert/1 that are still in
+       the database (listing/1 shows the current value of such a
+       variable when it is a list tail).
+   Marking follows bindings from the variables found in the roots;
+   BIND is rebuilt with only the marked bound variables. A trail entry
+   is kept only if its variable is marked and some live trail mark (a
+   choice point, a failure exit recorded by Solve, a findall,
+   directive, query, or PrologCall mark) lies below it; all live marks
+   are renumbered for the shortened trail. Retracted clauses that no
+   root-stack slot is still iterating over are dropped from the clause
+   stems once GCDBMIN of them have accumulated. Variable names and
+   renaming counters are never touched.
+   Triggers: an automatic collection when GCALLOC (bindings made +
+   clauses retracted since the last collection) reaches GCNEXT, which
+   is max(GCMIN, live bindings after the last collection); stress mode
+   (GCSTRESS = N > 0) collects every N Solve steps instead. Switches:
+   environment PROLOG_GC=off, PROLOG_GC_STRESS=N, PROLOG_GC_MIN=N;
+   builtins gc/0 (collect now and report), gc/1 (on, off, or a stress
+   interval N, 0 = normal), statistics/0; session command )gc.
+   ====================================================================== */
+InitGC: procedure = .void expose GCSP GCRG GCRM GCRF GCRI GCRT GCQ GCPF GCNT GCMK,
+                                 GCALLOC GCNEXT GCSTEPS GCSTRESS GCMIN GCON GCDBMIN GCDELIMS,
+                                 GCCOUNT GCFREEDB GCFREEDT GCFREEDC GCLAST GCMAXSP GCARRAYS
+  if GCARRAYS = '1' then do
+    call arraydrop GCRG
+    call arraydrop GCRM
+    call arraydrop GCRF
+    call arraydrop GCRI
+    call arraydrop GCRT
+    call arraydrop GCQ
+    call arraydrop GCPF
+    call arraydrop GCNT
+  end
+  else do
+    GCRG = .string[]
+    GCRM = .string[]
+    GCRF = .string[]
+    GCRI = .string[]
+    GCRT = .string[]
+    GCQ = .string[]
+    GCPF = .string[]
+    GCNT = .string[]
+    GCARRAYS = '1'
+  end
+  GCMK = .stem()
+  GCSP = 0
+  GCMAXSP = 0
+  GCDELIMS = ' ' || '01020304050607'x
+  GCALLOC = 0
+  GCSTEPS = 0
+  GCCOUNT = 0
+  GCFREEDB = 0
+  GCFREEDT = 0
+  GCFREEDC = 0
+  GCLAST = ''
+  GCDBMIN = 500
+  GCMIN = 5000
+  v = getenv('PROLOG_GC_MIN')
+  if datatype(v, 'W') = '1' then do
+    if v > 0 then GCMIN = v
+  end
+  GCON = '1'
+  v = translate(getenv('PROLOG_GC'))
+  if v = 'OFF' | v = '0' | v = 'NO' then GCON = '0'
+  GCSTRESS = 0
+  v = getenv('PROLOG_GC_STRESS')
+  if datatype(v, 'W') = '1' then do
+    if v > 0 then GCSTRESS = v
+  end
+  call GCSetNext 0
+  return
+
+/* GCSetNext: the next automatic trigger point, given the number of
+   bindings that survived the last collection */
+GCSetNext: procedure = .void expose GCNEXT GCMIN GCON GCSTRESS GCDBMIN
+  arg live = .string
+  if GCON \= '1' then do
+    GCNEXT = 999999999999
+    GCSTRESS = 0
+    return
+  end
+  GCNEXT = GCMIN
+  if live > GCNEXT then GCNEXT = live
+  if GCSTRESS > 0 then GCDBMIN = 1
+  else GCDBMIN = 500
+  return
+
+/* GCPushSlot / GCPopSlot: the GC root stack (see above). A slot holds
+   a goal list or any other space-separated list of terms (GCRG), the
+   trail mark of a pending choice point or sub-proof (GCRM), the oldest
+   failure-exit mark of a Solve loop (GCRF), the clause-id snapshot a
+   predicate call is iterating (GCRI) and a Solve loop's failure table
+   (GCRT). Marks held in a slot are renumbered by the collector, so the
+   owner always reads its mark back from the slot. */
+GCPushSlot: procedure = .string expose GCSP GCRG GCRM GCRF GCRI GCRT GCMAXSP
+  arg terms = .string
+  GCSP = GCSP + 1
+  if GCSP > GCMAXSP then GCMAXSP = GCSP
+  if GCSP > GCRG[0] then do
+    call arrayappend GCRG, terms
+    call arrayappend GCRM, ''
+    call arrayappend GCRF, ''
+    call arrayappend GCRI, ''
+    call arrayappend GCRT, ''
+  end
+  else do
+    GCRG[GCSP] = terms
+    GCRM[GCSP] = ''
+    GCRF[GCSP] = ''
+    GCRI[GCSP] = ''
+    GCRT[GCSP] = ''
+  end
+  return GCSP
+
+GCPopSlot: procedure = .void expose GCSP GCRG GCRM GCRF GCRI GCRT
+  arg slot = .string
+  GCRG[slot] = ''
+  GCRM[slot] = ''
+  GCRF[slot] = ''
+  GCRI[slot] = ''
+  GCRT[slot] = ''
+  GCSP = slot - 1
+  return
+
+/* GCScan: copies the binding of every bound variable named in s (any
+   string of encoded terms) into the new binding stem GCMK, if it is not
+   there yet, and queues the variable so that its binding gets scanned
+   in turn. GCMK doubles as the mark set: only bound variables matter
+   (unbound ones have nothing to keep and are never on the trail). */
+GCScan: procedure = .void expose BIND GCMK GCQ TVAR GCDELIMS
+  arg s = .string
+  n = length(s)
+  p = pos(TVAR, s)
+  do while p > 0
+    e = n + 1
+    if p < n then do
+      e = verify(s, GCDELIMS, 'M', p + 1)
+      if e = 0 then e = n + 1
+    end
+    vn = substr(s, p + 1, e - p - 1)
+    if vn \= '' then do
+      if GCMK[vn] = '' then do
+        b = BIND[vn]
+        if b \= '' then do
+          GCMK[vn] = b
+          call arrayappend GCQ, vn
+        end
+      end
+    end
+    if e > n then leave
+    p = pos(TVAR, s, e)
+  end
+  return
+
+/* VarNamesOf: the distinct variables of s, as a list of variable terms */
+VarNamesOf: procedure = .string expose TVAR GCDELIMS
+  arg s = .string
+  seen = .stem()
+  out = ''
+  n = length(s)
+  p = pos(TVAR, s)
+  do while p > 0
+    e = n + 1
+    if p < n then do
+      e = verify(s, GCDELIMS, 'M', p + 1)
+      if e = 0 then e = n + 1
+    end
+    vn = substr(s, p + 1, e - p - 1)
+    if vn \= '' then do
+      if seen[vn] \= '1' then do
+        seen[vn] = '1'
+        out = out TVAR || vn
+      end
+    end
+    if e > n then leave
+    p = pos(TVAR, s, e)
+  end
+  return strip(out)
+
+/* GCRemap: a trail mark's position in the compacted trail */
+GCRemap: procedure = .string expose GCPF
+  arg m = .string
+  if m = '' then return ''
+  if m <= 0 then return 0
+  return GCPF[m]
+
+GCCollect: procedure = .void expose BIND TRAIL GCSP GCRG GCRM GCRF GCRI GCQ GCPF GCNT GCMK,
+                                    GCALLOC GCSTEPS GCDBMIN GCCOUNT GCFREEDB GCFREEDT GCLAST,
+                                    QUERYVARMAP FINDALLACC FINDALLTEMPLATE APILASTMARK,
+                                    RTIDS CLVARS CLDEAD GCDEAD
+  arg reason = .string
+  s = 0
+  i = 0
+  vn = ''
+  id = ''
+  m = ''
+  oldb = BIND.size()
+  oldt = TRAIL[0]
+  call arraydrop GCQ
+  GCMK = .stem()
+
+  /* --- mark ---------------------------------------------------------- */
+  do s = 1 to GCSP
+    call GCScan GCRG[s]
+  end
+  call GCScan FINDALLACC
+  call GCScan FINDALLTEMPLATE
+  qn = QUERYVARMAP.tails()
+  do i = 1 to qn[0]
+    call GCScan QUERYVARMAP[qn[i]]
+  end
+  keep = ''
+  do i = 1 to words(RTIDS)
+    id = word(RTIDS, i)
+    if CLDEAD[id] = '1' then iterate
+    keep = keep id
+    call GCScan CLVARS[id]
+  end
+  RTIDS = strip(keep)
+  i = 1
+  do while i <= GCQ[0]
+    call GCScan GCMK[GCQ[i]]
+    i = i + 1
+  end
+  live = GCQ[0]
+
+  /* --- compact the trail ------------------------------------------------ */
+  minmark = oldt
+  if APILASTMARK \= '' then do
+    if APILASTMARK < minmark then minmark = APILASTMARK
+  end
+  do s = 1 to GCSP
+    m = GCRM[s]
+    if m \= '' then do
+      if m < minmark then minmark = m
+    end
+    m = GCRF[s]
+    if m \= '' then do
+      if m < minmark then minmark = m
+    end
+  end
+  call arraydrop GCPF
+  call arraydrop GCNT
+  kept = 0
+  do i = 1 to oldt
+    if i > minmark then do
+      vn = TRAIL[i]
+      if GCMK[vn] \= '' then do
+        kept = kept + 1
+        call arrayappend GCNT, vn
+      end
+    end
+    call arrayappend GCPF, kept
+  end
+  call arraydrop TRAIL
+  do i = 1 to kept
+    call arrayappend TRAIL, GCNT[i]
+  end
+  if APILASTMARK \= '' then APILASTMARK = GCRemap(APILASTMARK)
+  do s = 1 to GCSP
+    if GCRM[s] \= '' then GCRM[s] = GCRemap(GCRM[s])
+    if GCRF[s] \= '' then GCRF[s] = GCRemap(GCRF[s])
+  end
+
+  /* --- switch over, release the scratch structures ---------------------- */
+  BIND = GCMK
+  GCMK = .stem()
+  call arraydrop GCQ
+  call arraydrop GCPF
+  call arraydrop GCNT
+
+  freedc = 0
+  if GCDEAD > 0 then do
+    if GCDEAD >= GCDBMIN | reason = 'F' then freedc = GCCompactDB()
+  end
+
+  GCCOUNT = GCCOUNT + 1
+  GCFREEDB = GCFREEDB + oldb - live
+  GCFREEDT = GCFREEDT + oldt - kept
+  GCLAST = live || ' ' || (oldb - live) || ' ' || oldt || ' ' || kept || ' ' || freedc
+  GCALLOC = 0
+  GCSTEPS = 0
+  call GCSetNext live
+  return
+
+/* GCCompactDB: rebuilds the clause stems keeping only clauses still in
+   the database or in a clause list some running call is iterating;
+   returns how many retracted clauses were freed */
+GCCompactDB: procedure = .string expose CLHEAD CLBODY CLHNV CLFAK CLFAV CLFAN CLVARS CLDEAD,
+                                        PRED PREDLIST CLSTORED GCDEAD GCFREEDC GCSP GCRI
+  nh = .stem()
+  nbd = .stem()
+  nnv = .stem()
+  nfk = .stem()
+  nfv = .stem()
+  nfn = .stem()
+  nvs = .stem()
+  ndead = .stem()
+  ids = ''
+  i = 0
+  id = ''
+  stored = 0
+  dead = 0
+  do p = 1 to words(PREDLIST)
+    ids = PRED[word(PREDLIST, p)]
+    do i = 1 to words(ids)
+      id = word(ids, i)
+      if nh[id] = '' then do
+        nh[id] = CLHEAD[id]
+        nbd[id] = CLBODY[id]
+        nnv[id] = CLHNV[id]
+        nfk[id] = CLFAK[id]
+        nfv[id] = CLFAV[id]
+        nfn[id] = CLFAN[id]
+        if CLVARS[id] \= '' then nvs[id] = CLVARS[id]
+        stored = stored + 1
+      end
+    end
+  end
+  do s = 1 to GCSP
+    ids = GCRI[s]
+    do i = 1 to words(ids)
+      id = word(ids, i)
+      if nh[id] = '' & CLHEAD[id] \= '' then do
+        nh[id] = CLHEAD[id]
+        nbd[id] = CLBODY[id]
+        nnv[id] = CLHNV[id]
+        nfk[id] = CLFAK[id]
+        nfv[id] = CLFAV[id]
+        nfn[id] = CLFAN[id]
+        ndead[id] = '1'
+        stored = stored + 1
+        dead = dead + 1
+      end
+    end
+  end
+  freed = CLSTORED - stored
+  CLHEAD = nh
+  CLBODY = nbd
+  CLHNV = nnv
+  CLFAK = nfk
+  CLFAV = nfv
+  CLFAN = nfn
+  CLVARS = nvs
+  CLDEAD = ndead
+  CLSTORED = stored
+  GCDEAD = dead
+  GCFREEDC = GCFREEDC + freed
+  return freed
+
+/* GCNoteRetract: clause id has left the database */
+GCNoteRetract: procedure = .void expose CLDEAD GCDEAD GCALLOC
+  arg id = .string
+  CLDEAD[id] = '1'
+  GCDEAD = GCDEAD + 1
+  GCALLOC = GCALLOC + 1
+  return
+
+/* GCNoteRuntimeClause: the clause just added by assert/1 may contain
+   variables that are still live in the running program */
+GCNoteRuntimeClause: procedure = .void expose CLHEAD CLBODY CLVARS RTIDS
+  arg id = .string
+  vs = VarNamesOf(CLHEAD[id] CLBODY[id])
+  if vs = '' then return
+  CLVARS[id] = vs
+  RTIDS = RTIDS id
+  return
+
+/* GCReportLast: one line about the last collection (gc/0, )gc) */
+GCReportLast: procedure = .void expose GCLAST GCCOUNT
+  parse var GCLAST live freedb oldt kept freedc
+  say '% gc' GCCOUNT || ':' live 'live bindings,' freedb 'freed; trail' oldt '->' kept || ';',
+      freedc 'retracted clauses freed'
+  return
+
+GCStatistics: procedure = .void expose BIND TRAIL GCON GCSTRESS GCNEXT GCMIN GCCOUNT GCFREEDB,
+                                       GCFREEDT GCFREEDC GCMAXSP CLSTORED GCDEAD GCALLOC
+  mode = 'on'
+  if GCON \= '1' then mode = 'off'
+  if GCSTRESS > 0 then mode = 'stress, every' GCSTRESS 'steps'
+  say '% gc:' mode || ',' GCCOUNT 'collections, next after' GCNEXT 'allocations (' || GCALLOC 'so far)'
+  say '% bindings:' BIND.size() 'stored,' GCFREEDB 'freed so far'
+  say '% trail:' TRAIL[0] 'entries,' GCFREEDT 'freed so far'
+  say '% clauses:' CLSTORED 'stored (' || GCDEAD 'retracted, not yet freed),' GCFREEDC 'freed so far'
+  say '% deepest root stack:' GCMAXSP 'slots'
+  return
+
+/* GCSwitch: gc(on), gc(off), gc(N) -- N > 0 is stress mode (collect
+   every N steps), 0 is normal automatic collection */
+GCSwitch: procedure = .string expose GCON GCSTRESS GCALLOC GCSTEPS
+  arg v = .string
+  if v = 'on' then do
+    GCON = '1'
+    GCSTRESS = 0
+  end
+  else if v = 'off' then GCON = '0'
+  else if datatype(v, 'W') = '1' then do
+    if v < 0 then return '0'
+    GCON = '1'
+    GCSTRESS = v
+  end
+  else return '0'
+  GCSTEPS = 0
+  call GCSetNext 0
+  return '1'
+
+/* ======================================================================
    BUILT-IN PREDICATES
    Everything here is deterministic (succeeds at most once); list
    utilities and other predicates naturally defined by ordinary
@@ -2580,7 +3319,7 @@ InitBuiltins: procedure = .void expose BUILTINSET
          'assert/1 asserta/1 assertz/1 retract/1 retractall/1',
          'findall/3 write/1 writeln/1 nl/0 print/1 tab/1',
          'consult/1 listing/0 listing_all/0 listing/1 save/1 save_all/1 load/1',
-         'crexx_call/2 crexx_call/3',
+         'crexx_call/2 crexx_call/3 gc/0 gc/1 statistics/0',
          'halt/0 halt/1'
   do i = 1 to words(list)
     BUILTINSET[word(list,i)] = "1"
@@ -2595,38 +3334,38 @@ SolveBuiltin: procedure = .string expose CLHEAD CLBODY PRED PREDLIST CLCOUNTER
 
   select
     when key = '=/2' then do
-      if Unify(ArgN(goal,1), ArgN(goal,2)) = '1' then return Solve(rest)
+      if Unify(ArgN(goal,1), ArgN(goal,2)) = '1' then return '1'
       return '0'
     end
     when key = '\=/2' then do
       mark = TrailMark()
       ok = Unify(ArgN(goal,1), ArgN(goal,2))
       call TrailUndo mark
-      if ok \= '1' then return Solve(rest)
+      if ok \= '1' then return '1'
       return '0'
     end
     when key = '==/2' then do
-      if TermEqual(ArgN(goal,1), ArgN(goal,2)) = '1' then return Solve(rest)
+      if TermEqual(ArgN(goal,1), ArgN(goal,2)) = '1' then return '1'
       return '0'
     end
     when key = '\==/2' then do
-      if TermEqual(ArgN(goal,1), ArgN(goal,2)) \= '1' then return Solve(rest)
+      if TermEqual(ArgN(goal,1), ArgN(goal,2)) \= '1' then return '1'
       return '0'
     end
     when key = '@</2' then do
-      if TermCompare(ArgN(goal,1), ArgN(goal,2)) < 0 then return Solve(rest)
+      if TermCompare(ArgN(goal,1), ArgN(goal,2)) < 0 then return '1'
       return '0'
     end
     when key = '@>/2' then do
-      if TermCompare(ArgN(goal,1), ArgN(goal,2)) > 0 then return Solve(rest)
+      if TermCompare(ArgN(goal,1), ArgN(goal,2)) > 0 then return '1'
       return '0'
     end
     when key = '@=</2' then do
-      if TermCompare(ArgN(goal,1), ArgN(goal,2)) <= 0 then return Solve(rest)
+      if TermCompare(ArgN(goal,1), ArgN(goal,2)) <= 0 then return '1'
       return '0'
     end
     when key = '@>=/2' then do
-      if TermCompare(ArgN(goal,1), ArgN(goal,2)) >= 0 then return Solve(rest)
+      if TermCompare(ArgN(goal,1), ArgN(goal,2)) >= 0 then return '1'
       return '0'
     end
     when key = 'compare/3' then do
@@ -2634,14 +3373,14 @@ SolveBuiltin: procedure = .string expose CLHEAD CLBODY PRED PREDLIST CLCOUNTER
       symb = '='
       if c < 0 then symb = '<'
       if c > 0 then symb = '>'
-      if Unify(ArgN(goal,1), symb) = '1' then return Solve(rest)
+      if Unify(ArgN(goal,1), symb) = '1' then return '1'
       return '0'
     end
 
     when key = 'is/2' then do
       v = ArithEval(ArgN(goal,2))
       if v = '' then return '0'
-      if Unify(ArgN(goal,1), v) = '1' then return Solve(rest)
+      if Unify(ArgN(goal,1), v) = '1' then return '1'
       return '0'
     end
     when key = '</2' then return SolveArithCmp('<', goal, rest)
@@ -2652,50 +3391,50 @@ SolveBuiltin: procedure = .string expose CLHEAD CLBODY PRED PREDLIST CLCOUNTER
     when key = '=\=/2' then return SolveArithCmp('=\=', goal, rest)
 
     when key = 'var/1' then do
-      if IsVar(Deref(ArgN(goal,1))) = '1' then return Solve(rest)
+      if IsVar(Deref(ArgN(goal,1))) = '1' then return '1'
       return '0'
     end
     when key = 'nonvar/1' then do
-      if IsVar(Deref(ArgN(goal,1))) \= '1' then return Solve(rest)
+      if IsVar(Deref(ArgN(goal,1))) \= '1' then return '1'
       return '0'
     end
     when key = 'atom/1' then do
-      if IsAtom(Deref(ArgN(goal,1))) = '1' then return Solve(rest)
+      if IsAtom(Deref(ArgN(goal,1))) = '1' then return '1'
       return '0'
     end
     when key = 'atomic/1' then do
-      if IsAtomic(Deref(ArgN(goal,1))) = '1' then return Solve(rest)
+      if IsAtomic(Deref(ArgN(goal,1))) = '1' then return '1'
       return '0'
     end
     when key = 'number/1' then do
-      if IsNumber(Deref(ArgN(goal,1))) = '1' then return Solve(rest)
+      if IsNumber(Deref(ArgN(goal,1))) = '1' then return '1'
       return '0'
     end
     when key = 'integer/1' then do
       v = Deref(ArgN(goal,1))
-      if IsNumber(v) = '1' & v = trunc(v) then return Solve(rest)
+      if IsNumber(v) = '1' & v = trunc(v) then return '1'
       return '0'
     end
     when key = 'float/1' then do
       v = Deref(ArgN(goal,1))
-      if IsNumber(v) = '1' & v \= trunc(v) then return Solve(rest)
+      if IsNumber(v) = '1' & v \= trunc(v) then return '1'
       return '0'
     end
     when key = 'compound/1' then do
-      if IsCompound(Deref(ArgN(goal,1))) = '1' then return Solve(rest)
+      if IsCompound(Deref(ArgN(goal,1))) = '1' then return '1'
       return '0'
     end
     when key = 'callable/1' then do
       v = Deref(ArgN(goal,1))
-      if IsAtom(v) = '1' | IsCompound(v) = '1' then return Solve(rest)
+      if IsAtom(v) = '1' | IsCompound(v) = '1' then return '1'
       return '0'
     end
     when key = 'is_list/1' then do
-      if IsProperList(ArgN(goal,1)) = '1' then return Solve(rest)
+      if IsProperList(ArgN(goal,1)) = '1' then return '1'
       return '0'
     end
     when key = 'ground/1' then do
-      if IsGround(ArgN(goal,1)) = '1' then return Solve(rest)
+      if IsGround(ArgN(goal,1)) = '1' then return '1'
       return '0'
     end
 
@@ -2705,7 +3444,7 @@ SolveBuiltin: procedure = .string expose CLHEAD CLBODY PRED PREDLIST CLCOUNTER
     when key = 'copy_term/2' then do
       call RenameFreshStart
       copy = RenameTerm(DerefFull(ArgN(goal,1)))
-      if Unify(ArgN(goal,2), copy) = '1' then return Solve(rest)
+      if Unify(ArgN(goal,2), copy) = '1' then return '1'
       return '0'
     end
 
@@ -2715,34 +3454,37 @@ SolveBuiltin: procedure = .string expose CLHEAD CLBODY PRED PREDLIST CLCOUNTER
     when key = 'number_chars/2' then return SolveNumberChars(goal, rest)
     when key = 'atom_length/2' then do
       v = Deref(ArgN(goal,1))
-      if Unify(ArgN(goal,2), length(AtomText(v))) = '1' then return Solve(rest)
+      if Unify(ArgN(goal,2), length(AtomText(v))) = '1' then return '1'
       return '0'
     end
     when key = 'char_code/2' then return SolveCharCode(goal, rest)
     when key = 'atom_concat/3' then return SolveAtomConcat(goal, rest)
     when key = 'upcase_atom/2' then do
       v = Deref(ArgN(goal,1))
-      if Unify(ArgN(goal,2), MkQAtom(translate(AtomText(v)))) = '1' then return Solve(rest)
+      if Unify(ArgN(goal,2), MkQAtom(translate(AtomText(v)))) = '1' then return '1'
       return '0'
     end
     when key = 'downcase_atom/2' then do
       v = Deref(ArgN(goal,1))
       lc = translate(AtomText(v), xrange('a','z'), xrange('A','Z'))
-      if Unify(ArgN(goal,2), MkQAtom(lc)) = '1' then return Solve(rest)
+      if Unify(ArgN(goal,2), MkQAtom(lc)) = '1' then return '1'
       return '0'
     end
 
     when key = 'assert/1' then do
       call AssertClause DerefFull(ArgN(goal,1)), '1'
-      return Solve(rest)
+      call GCNoteRuntimeClause CLCOUNTER
+      return '1'
     end
     when key = 'assertz/1' then do
       call AssertClause DerefFull(ArgN(goal,1)), '1'
-      return Solve(rest)
+      call GCNoteRuntimeClause CLCOUNTER
+      return '1'
     end
     when key = 'asserta/1' then do
       call AssertClause DerefFull(ArgN(goal,1)), '0'
-      return Solve(rest)
+      call GCNoteRuntimeClause CLCOUNTER
+      return '1'
     end
     when key = 'retract/1' then do
       t = DerefFull(ArgN(goal,1))
@@ -2752,69 +3494,80 @@ SolveBuiltin: procedure = .string expose CLHEAD CLBODY PRED PREDLIST CLCOUNTER
         headpat = ArgN(t,1)
         bodypat = ArgN(t,2)
       end
-      if RetractClause(headpat, bodypat) = '1' then return Solve(rest)
+      if RetractClause(headpat, bodypat) = '1' then return '1'
       return '0'
     end
     when key = 'retractall/1' then do
       call RetractAll DerefFull(ArgN(goal,1))
-      return Solve(rest)
+      return '1'
     end
 
     when key = 'findall/3' then return SolveFindall(goal, rest)
 
     when key = 'consult/1' then do
       call ConsultFile AtomText(Deref(ArgN(goal,1)))
-      return Solve(rest)
+      return '1'
     end
     when key = 'load/1' then do
       call ConsultFile AtomText(Deref(ArgN(goal,1)))
-      return Solve(rest)
+      return '1'
     end
     when key = 'listing/0' then do
       call ListingAll '1'
-      return Solve(rest)
+      return '1'
     end
     when key = 'listing_all/0' then do
       call ListingAll '0'
-      return Solve(rest)
+      return '1'
     end
     when key = 'listing/1' then do
       call ListingOne AtomText(Deref(ArgN(goal,1)))
-      return Solve(rest)
+      return '1'
     end
     when key = 'save/1' then do
       call SaveWorkspace AtomText(Deref(ArgN(goal,1))), '1'
-      return Solve(rest)
+      return '1'
     end
     when key = 'save_all/1' then do
       call SaveWorkspace AtomText(Deref(ArgN(goal,1))), '0'
-      return Solve(rest)
+      return '1'
     end
 
     when key = 'write/1' then do
       call charout , WriteTerm(DerefFull(ArgN(goal,1)), 0)
-      return Solve(rest)
+      return '1'
     end
     when key = 'print/1' then do
       call charout , WriteTerm(DerefFull(ArgN(goal,1)), 1)
-      return Solve(rest)
+      return '1'
     end
     when key = 'writeln/1' then do
       say WriteTerm(DerefFull(ArgN(goal,1)), 0)
-      return Solve(rest)
+      return '1'
     end
     when key = 'nl/0' then do
       say ''
-      return Solve(rest)
+      return '1'
     end
     when key = 'tab/1' then do
       n = ArithEval(ArgN(goal,1))
       call charout , copies(' ', n)
-      return Solve(rest)
+      return '1'
     end
 
     when key = 'crexx_call/2' then return SolveCrexxCall(goal, rest, '')
     when key = 'crexx_call/3' then return SolveCrexxCall(goal, rest, WriteTerm(DerefFull(ArgN(goal,2)), 0))
+
+    when key = 'gc/0' then do
+      call GCCollect 'F'
+      call GCReportLast
+      return '1'
+    end
+    when key = 'gc/1' then return GCSwitch(AtomText(Deref(ArgN(goal,1))))
+    when key = 'statistics/0' then do
+      call GCStatistics
+      return '1'
+    end
 
     when key = 'halt/0' then do
       say 'prolog: halt'
@@ -2848,7 +3601,7 @@ SolveArithCmp: procedure = .string
     when op = '=\=' then do; if a \= b then ok = 1; end
     otherwise nop
   end
-  if ok = 1 then return Solve(rest)
+  if ok = 1 then return '1'
   return '0'
 
 IsProperList: procedure = .string
@@ -2896,14 +3649,14 @@ SolveFunctorDecompose: procedure = .string
   else ftterm = MkQAtom(nm)
   if Unify(ArgN(goal,2), ftterm) \= '1' then return '0'
   if Unify(ArgN(goal,3), farty) \= '1' then return '0'
-  return Solve(rest)
+  return '1'
 
 SolveFunctorCompose: procedure = .string
   arg t = .string, goal = .string, rest = .string
   nm = Deref(ArgN(goal,2))
   farty = Deref(ArgN(goal,3))
   if farty = 0 then do
-    if Unify(t, nm) = '1' then return Solve(rest)
+    if Unify(t, nm) = '1' then return '1'
     return '0'
   end
   args = GLEmpty()
@@ -2913,7 +3666,7 @@ SolveFunctorCompose: procedure = .string
     args = GLAppend(args, MkVar('FA' || RVARCOUNTER))
   end
   newterm = MkCompound(AtomText(nm), args)
-  if Unify(t, newterm) = '1' then return Solve(rest)
+  if Unify(t, newterm) = '1' then return '1'
   return '0'
 
 SolveArg3: procedure = .string
@@ -2922,7 +3675,7 @@ SolveArg3: procedure = .string
   t = Deref(ArgN(goal,2))
   if IsCompound(t) \= '1' then return '0'
   if n < 1 | n > Arity(t) then return '0'
-  if Unify(ArgN(goal,3), ArgN(t,n)) = '1' then return Solve(rest)
+  if Unify(ArgN(goal,3), ArgN(t,n)) = '1' then return '1'
   return '0'
 
 SolveUniv: procedure = .string
@@ -2938,18 +3691,18 @@ SolveUniv: procedure = .string
     end
     else if IsNumber(t) = '1' then lst = GLAppend(lst, t)
     else lst = GLAppend(lst, MkQAtom(AtomText(t)))
-    if Unify(ArgN(goal,2), PBuildConsChain(lst, '[]')) = '1' then return Solve(rest)
+    if Unify(ArgN(goal,2), PBuildConsChain(lst, '[]')) = '1' then return '1'
     return '0'
   end
   items = ListToGL(Deref(ArgN(goal,2)))
   if GLCount(items) = 0 then return '0'
   if GLCount(items) = 1 then do
-    if Unify(t, GLNth(items,1)) = '1' then return Solve(rest)
+    if Unify(t, GLNth(items,1)) = '1' then return '1'
     return '0'
   end
   fn = AtomText(Deref(GLNth(items,1)))
   args = GLRest(items)
-  if Unify(t, MkCompound(fn, args)) = '1' then return Solve(rest)
+  if Unify(t, MkCompound(fn, args)) = '1' then return '1'
   return '0'
 
 /* ListToGL: a proper Prolog list -> a goal list of its (un-dereffed)
@@ -2971,11 +3724,11 @@ SolveAtomCodes: procedure = .string
   if IsVar(a) \= '1' then do
     txt = AtomText(a)
     if IsNumber(a) = '1' then txt = a
-    if Unify(ArgN(goal,2), PCodesToList(txt)) = '1' then return Solve(rest)
+    if Unify(ArgN(goal,2), PCodesToList(txt)) = '1' then return '1'
     return '0'
   end
   txt = CodesToText(Deref(ArgN(goal,2)))
-  if Unify(a, MkQAtom(txt)) = '1' then return Solve(rest)
+  if Unify(a, MkQAtom(txt)) = '1' then return '1'
   return '0'
 
 SolveAtomChars: procedure = .string
@@ -2985,18 +3738,18 @@ SolveAtomChars: procedure = .string
   if IsVar(a) \= '1' then do
     txt = AtomText(a)
     if IsNumber(a) = '1' then txt = a
-    if Unify(ArgN(goal,2), CharsListFromText(txt)) = '1' then return Solve(rest)
+    if Unify(ArgN(goal,2), CharsListFromText(txt)) = '1' then return '1'
     return '0'
   end
   txt = CharsToText(Deref(ArgN(goal,2)))
-  if Unify(a, MkQAtom(txt)) = '1' then return Solve(rest)
+  if Unify(a, MkQAtom(txt)) = '1' then return '1'
   return '0'
 
 SolveNumberCodes: procedure = .string
   arg goal = .string, rest = .string
   a = Deref(ArgN(goal,1))
   if IsVar(a) \= '1' then do
-    if Unify(ArgN(goal,2), PCodesToList(a)) = '1' then return Solve(rest)
+    if Unify(ArgN(goal,2), PCodesToList(a)) = '1' then return '1'
     return '0'
   end
   txt = CodesToText(Deref(ArgN(goal,2)))
@@ -3004,14 +3757,14 @@ SolveNumberCodes: procedure = .string
     say 'prolog: number_codes: not a number:' txt
     return '0'
   end
-  if Unify(a, txt) = '1' then return Solve(rest)
+  if Unify(a, txt) = '1' then return '1'
   return '0'
 
 SolveNumberChars: procedure = .string
   arg goal = .string, rest = .string
   a = Deref(ArgN(goal,1))
   if IsVar(a) \= '1' then do
-    if Unify(ArgN(goal,2), CharsListFromText(a)) = '1' then return Solve(rest)
+    if Unify(ArgN(goal,2), CharsListFromText(a)) = '1' then return '1'
     return '0'
   end
   txt = CharsToText(Deref(ArgN(goal,2)))
@@ -3019,7 +3772,7 @@ SolveNumberChars: procedure = .string
     say 'prolog: number_chars: not a number:' txt
     return '0'
   end
-  if Unify(a, txt) = '1' then return Solve(rest)
+  if Unify(a, txt) = '1' then return '1'
   return '0'
 
 CharsListFromText: procedure = .string
@@ -3052,11 +3805,11 @@ SolveCharCode: procedure = .string
   arg goal = .string, rest = .string
   a = Deref(ArgN(goal,1))
   if IsVar(a) \= '1' then do
-    if Unify(ArgN(goal,2), c2d(AtomText(a))) = '1' then return Solve(rest)
+    if Unify(ArgN(goal,2), c2d(AtomText(a))) = '1' then return '1'
     return '0'
   end
   code = Deref(ArgN(goal,2))
-  if Unify(a, MkQAtom(d2c(code))) = '1' then return Solve(rest)
+  if Unify(a, MkQAtom(d2c(code))) = '1' then return '1'
   return '0'
 
 SolveAtomConcat: procedure = .string
@@ -3068,7 +3821,7 @@ SolveAtomConcat: procedure = .string
     if IsNumber(a) = '1' then ta = a
     tb = AtomText(b)
     if IsNumber(b) = '1' then tb = b
-    if Unify(ArgN(goal,3), MkQAtom(ta || tb)) = '1' then return Solve(rest)
+    if Unify(ArgN(goal,3), MkQAtom(ta || tb)) = '1' then return '1'
     return '0'
   end
   /* nondeterministic split mode isn't supported (a documented
@@ -3087,12 +3840,13 @@ RetractAll: procedure = .void expose CLHEAD CLBODY PRED
     call RenameFreshStart
     rhead = RenameTerm(CLHEAD[id])
     if Unify(pat, rhead) \= '1' then keep = GLAppend(keep, id)
+    else call GCNoteRetract id
     call TrailUndo mark
   end
   PRED[key] = keep
   return
 
-SolveFindall: procedure = .string expose SOLVEMODE FINDALLACC FINDALLTEMPLATE
+SolveFindall: procedure = .string expose SOLVEMODE FINDALLACC FINDALLTEMPLATE GCRM
   arg goal = .string, rest = .string
   tmpl = ArgN(goal, 1)
   innergoal = ArgN(goal, 2)
@@ -3102,14 +3856,16 @@ SolveFindall: procedure = .string expose SOLVEMODE FINDALLACC FINDALLTEMPLATE
   SOLVEMODE = 'FINDALL'
   FINDALLACC = GLEmpty()
   FINDALLTEMPLATE = tmpl
-  mark = TrailMark()
+  slot = GCPushSlot(GLConcat(savedacc, savedtmpl))
+  GCRM[slot] = TrailMark()
   call Solve GLAppend(GLEmpty(), innergoal)
-  call TrailUndo mark
+  call TrailUndo GCRM[slot]
+  call GCPopSlot slot
   results = FINDALLACC
   SOLVEMODE = savedmode
   FINDALLACC = savedacc
   FINDALLTEMPLATE = savedtmpl
-  if Unify(ArgN(goal,3), PBuildConsChain(results, '[]')) = '1' then return Solve(rest)
+  if Unify(ArgN(goal,3), PBuildConsChain(results, '[]')) = '1' then return '1'
   return '0'
 
 /* ======================================================================
@@ -3168,5 +3924,5 @@ SolveCrexxCall: procedure = .string
   end
   resultterm = res
   if IsNumber(res) \= '1' then resultterm = MkQAtom(res)
-  if Unify(ArgN(goal, resultpos), resultterm) = '1' then return Solve(rest)
+  if Unify(ArgN(goal, resultpos), resultterm) = '1' then return '1'
   return '0'
