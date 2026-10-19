@@ -1,0 +1,48 @@
+[97,98,99]
+hi
+[h,e,l,l,o]
+world
+5
+11
+5
+abcdef
+abc123
+hello world
+'hello world'
+97
+B
+HELLO WORLD
+hello world
+43
+12.5
+[49,50]
+12
+atom
+[97,98,99]
+xyz
+string_is_list
+prolog: atom_concat/3: first two arguments must both be bound (split mode is not supported)
+failed
+cba
+ABC / 3
+prolog: unknown procedure succ_code/2
+prolog: directive failed: :- atom_codes(abc,_Cs_169),maplist(succ_code,_Cs_169,_Ds_170),atom_codes(_R_171,_Ds_170),writeln(_R_171)
+prolog: number_codes: not a number: abc
+prolog: directive failed: :- number_codes(_N_174,[97,98,99]),writeln(_N_174)
+same
+prolog: unknown procedure writeq/1
+prolog: directive failed: :- writeq('hello world'),nl
+'it''s'
+[a,'B',[99]]
+f('A b',c)
+[]
+[]
+hello
+'Hello'
+'_x'
+''
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+
+goodbye.

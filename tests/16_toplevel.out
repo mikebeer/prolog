@@ -1,0 +1,219 @@
+loaded
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+X = mary
+     more (;)? X = john
+     more (;)? false.
+?-
+X = wine
+     more (;)? ?-
+Y = wine
+     more (;)? ?-
+%  added: father(adam,cain)
+?-
+%  added: father(adam,abel)
+?-
+X = cain
+     more (;)? X = abel
+     more (;)? false.
+?-
+%  added: grandfather(_X_146,_Y_147) :- father(_X_146,_Z_148),father(_Z_148,_Y_147)
+?-
+likes(mary,wine).
+likes(john,wine).
+likes(john,mary).
+
+father(adam,cain).
+father(adam,abel).
+
+grandfather(_X_146,_Y_147) :-
+    father(_X_146,_Z_148),father(_Z_148,_Y_147).
+
+true.
+     more (;)? ?-
+false.
+?-
+X = adam, Y = cain
+     more (;)? X = adam, Y = abel
+     more (;)? false.
+?-
+X = 1, Y = 2, Z = f(1,2)
+     more (;)? ?-
+%  added: foo
+?-
+true.
+     more (;)? ?-
+prolog: unknown procedure bar/0
+false.
+?-
+?-
+true.
+     more (;)? ?-
+true.
+     more (;)? ?-
+?-
+X = 5
+     more (;)? ?-
+session commands:
+  )listing      list what YOU added this session (not the
+                built-in library -- see listing_all below)
+  )lib [dir]    list .pl files available to consult (current
+                directory, or [dir] if given)
+  )clear        wipe the database back to a fresh session
+                (the built-in library is reloaded, your own
+                facts/rules/assertions are gone)
+  )help  or )?  show this message
+  )quit )exit   end the session
+
+the terminator says what you mean:
+  end a QUERY with ?   -- asks whether it is true / for a value:
+    female(ann)?
+    parent(tom, X)?
+  end a FACT or RULE with .  -- adds it to the database:
+    female(ann).
+    grandparent(X,Z) :- parent(X,Y), parent(Y,Z).
+  ?- goal.  and  :- goal.  (SWI/file-directive style, ending in .) also work and are treated as queries, for anything pasted in from elsewhere.
+
+exporting/reloading what you built this session:
+  save(File)?          save what YOU added (not the built-in library) as loadable Prolog source
+  save_all(File)?      save EVERYTHING, built-in library included -- a fully self-contained file
+  consult(File)?       load clauses/directives from a file (also: load(File)?)
+
+other goals, typed as a query:
+  listing?             list what you added this session
+  listing_all?         list the whole database, library included
+  listing(Name)?       list clauses for Name (any arity), library or not
+  halt?                end the session (or just: halt.)
+?-
+prolog: )lib -- cannot read directory: nonexistent_directory_xyz
+?-
+prolog: workspace cleared.
+?-
+prolog: unknown procedure father/2
+false.
+?-
+append([],_L_1,_L_1).
+append([_H_2|_T_3],_L_4,[_H_2|_R_5]) :-
+    append(_T_3,_L_4,_R_5).
+
+member(_X_6,[_X_6|_G7]).
+member(_X_8,[_G9|_T_10]) :-
+    member(_X_8,_T_10).
+
+length([],0).
+length([_G11|_T_12],_N_13) :-
+    length(_T_12,_N0_14),_N_13 is _N0_14 + 1.
+
+reverse(_L_15,_R_16) :-
+    reverse_(_L_15,[],_R_16).
+
+reverse_([],_A_17,_A_17).
+reverse_([_H_18|_T_19],_A_20,_R_21) :-
+    reverse_(_T_19,[_H_18|_A_20],_R_21).
+
+last([_X_22],_X_22) :-
+    !.
+last([_G23|_T_24],_X_25) :-
+    last(_T_24,_X_25).
+
+nth0(0,[_X_26|_G27],_X_26) :-
+    !.
+nth0(_N_28,[_G29|_T_30],_X_31) :-
+    integer(_N_28),_N_28 > 0,_N1_32 is _N_28 - 1,nth0(_N1_32,_T_30,_X_31).
+
+nth1(1,[_X_33|_G34],_X_33) :-
+    !.
+nth1(_N_35,[_G36|_T_37],_X_38) :-
+    integer(_N_35),_N_35 > 1,_N1_39 is _N_35 - 1,nth1(_N1_39,_T_37,_X_38).
+
+sum_list([],0).
+sum_list([_H_40|_T_41],_S_42) :-
+    sum_list(_T_41,_S0_43),_S_42 is _S0_43 + _H_40.
+
+max_list([_X_44],_X_44) :-
+    !.
+max_list([_H_45|_T_46],_M_47) :-
+    max_list(_T_46,_M0_48),(_H_45 >= _M0_48 -> _M_47 = _H_45 ; _M_47 = _M0_48).
+
+min_list([_X_49],_X_49) :-
+    !.
+min_list([_H_50|_T_51],_M_52) :-
+    min_list(_T_51,_M0_53),(_H_50 =< _M0_53 -> _M_52 = _H_50 ; _M_52 = _M0_53).
+
+between(_L_54,_H_55,_L_54) :-
+    _L_54 =< _H_55.
+between(_L_56,_H_57,_X_58) :-
+    _L_56 < _H_57,_L1_59 is _L_56 + 1,between(_L1_59,_H_57,_X_58).
+
+forall(_Cond_60,_Action_61) :-
+    \+ (_Cond_60,\+ _Action_61).
+
+select(_X_62,[_X_62|_T_63],_T_63).
+select(_X_64,[_H_65|_T_66],[_H_65|_R_67]) :-
+    select(_X_64,_T_66,_R_67).
+
+selectchk(_X_68,_L_69,_R_70) :-
+    select(_X_68,_L_69,_R_70),!.
+
+permutation([],[]).
+permutation(_L_71,[_H_72|_T_73]) :-
+    select(_H_72,_L_71,_R_74),permutation(_R_74,_T_73).
+
+delete([],_G75,[]).
+delete([_X_76|_T_77],_X_76,_R_78) :-
+    !,delete(_T_77,_X_76,_R_78).
+delete([_H_79|_T_80],_X_81,[_H_79|_R_82]) :-
+    delete(_T_80,_X_81,_R_82).
+
+exclude(_G83,[],[]).
+exclude(_P_84,[_H_85|_T_86],_R_87) :-
+    call(_P_84,_H_85) -> exclude(_P_84,_T_86,_R_87) ; _R_87 = [_H_85|_R1_88],exclude(_P_84,_T_86,_R1_88).
+
+include(_G89,[],[]).
+include(_P_90,[_H_91|_T_92],_R_93) :-
+    call(_P_90,_H_91) -> _R_93 = [_H_91|_R1_94],include(_P_90,_T_92,_R1_94) ; include(_P_90,_T_92,_R_93).
+
+maplist(_G95,[]).
+maplist(_P_96,[_H_97|_T_98]) :-
+    call(_P_96,_H_97),maplist(_P_96,_T_98).
+
+maplist(_G99,[],[]).
+maplist(_P_100,[_H_101|_T_102],[_H2_103|_T2_104]) :-
+    call(_P_100,_H_101,_H2_103),maplist(_P_100,_T_102,_T2_104).
+
+maplist(_G105,[],[],[]).
+maplist(_P_106,[_H_107|_T_108],[_H2_109|_T2_110],[_H3_111|_T3_112]) :-
+    call(_P_106,_H_107,_H2_109,_H3_111),maplist(_P_106,_T_108,_T2_110,_T3_112).
+
+msort_insert(_X_113,[],[_X_113]).
+msort_insert(_X_114,[_H_115|_T_116],[_X_114,_H_115|_T_116]) :-
+    _X_114 @=< _H_115,!.
+msort_insert(_X_117,[_H_118|_T_119],[_H_118|_R_120]) :-
+    msort_insert(_X_117,_T_119,_R_120).
+
+msort([],[]).
+msort([_H_121|_T_122],_S_123) :-
+    msort(_T_122,_S0_124),msort_insert(_H_121,_S0_124,_S_123).
+
+sort(_L_125,_S_126) :-
+    msort(_L_125,_S0_127),dedupe_(_S0_127,_S_126).
+
+dedupe_([],[]).
+dedupe_([_X_128],[_X_128]) :-
+    !.
+dedupe_([_X_129,_Y_130|_T_131],_R_132) :-
+    _X_129 == _Y_130,!,dedupe_([_Y_130|_T_131],_R_132).
+dedupe_([_X_133,_Y_134|_T_135],[_X_133|_R_136]) :-
+    dedupe_([_Y_134|_T_135],_R_136).
+
+concat_atom([],'').
+concat_atom([_A_137],_A_137) :-
+    !.
+concat_atom([_A_138|_T_139],_R_140) :-
+    concat_atom(_T_139,_R0_141),atom_concat(_A_138,_R0_141,_R_140).
+
+true.
+     more (;)? ?-
+
+goodbye.

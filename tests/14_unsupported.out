@@ -1,0 +1,46 @@
+prolog: unknown procedure catch/3
+prolog: directive failed: :- catch(throw(my_error),_E_142,(write(caught(_E_142)),nl))
+prolog: unknown procedure catch/3
+prolog: directive failed: :- catch(_X_143 is 1 / 0,error(_E_144,_G145),(write(_E_144),nl))
+prolog: unknown procedure bagof/3
+prolog: directive failed: :- bagof(_X_146,member(_X_146,[a,b]),_L_147),writeln(_L_147)
+prolog: unknown procedure setof/3
+prolog: directive failed: :- setof(_X_148,member(_X_148,[b,a]),_L_149),writeln(_L_149)
+prolog: unknown procedure format/2
+prolog: directive failed: :- format([126,119,32,97,110,100,32,126,97,126,110],[x,y])
+prolog: unknown procedure succ/2
+prolog: directive failed: :- succ(3,_X_150),writeln(_X_150)
+prolog: unknown procedure plus/3
+prolog: directive failed: :- plus(1,2,_X_151),writeln(_X_151)
+prolog: unknown procedure sub_atom/5
+prolog: directive failed: :- sub_atom(hello,1,3,_G152,_S_153),writeln(_S_153)
+prolog: unknown procedure nb_setval/2
+prolog: directive failed: :- nb_setval(k,1)
+prolog: unknown procedure string_concat/3
+prolog: directive failed: :- string_concat([97],[98],_S_154)
+prolog: unknown procedure number_vars/3
+prolog: directive failed: :- number_vars(f(_X_155),0,_G156)
+  x
+prolog: unknown procedure phrase/2
+prolog: directive failed: :- phrase(greeting,[hello,world])
+[a,_G11#5]
+prolog: unknown procedure sumlist/2
+[a,b]
+prolog: unknown procedure predsort/3
+prolog: directive failed: :- predsort(compare,[b,a],_L_162),writeln(_L_162)
+prolog: unknown procedure nth_clause/3
+prolog: directive failed: :- nth_clause(a,1,_R_163)
+prolog: unknown procedure apply/2
+prolog: directive failed: :- apply(writeln,[x])
+prolog: unknown procedure ignore/1
+prolog: directive failed: :- ignore(fail),writeln(ignored)
+prolog: unknown procedure once/1
+prolog: directive failed: :- once(member(_X_164,[1,2])),writeln(_X_164)
+prolog: arithmetic: not evaluable: inf
+prolog: arithmetic: not evaluable: inf
+prolog: directive failed: :- between(1,inf,_X_165),_X_165 > 3,!,writeln(_X_165)
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+
+goodbye.

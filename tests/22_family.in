@@ -1,0 +1,8 @@
+ancestor(tom, X)?
+;
+;
+;
+;
+;
+sibling(ann, X)?
+

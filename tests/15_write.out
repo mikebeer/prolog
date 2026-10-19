@@ -1,0 +1,21 @@
+hello
+hello world
+'hello world'
+[1,2,3]
+[a|b]
+A
+'A'
+[97,32,115,116,114,105,110,103]
+f(_X_142,_Y_143,_X_142)
+f(_G144,_G145)
+f([99,111,100,101,32,108,105,115,116])
+   x  y
+a b
+[]
+[]
+prolog: syntax error -- expected , or ) near }
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+
+goodbye.

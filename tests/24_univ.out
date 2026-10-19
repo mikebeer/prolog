@@ -1,0 +1,37 @@
+[foo,a,b]
+foo(1,2)
+foo
+3
+[3]
+[foo]
+[.,a,[b]]
+1 + 2
+3
+f / 3
+g(_FA1,_FA2,_FA3)
+. / 2
+foo / 0
+foo
+x / y
+no
+no
+no
+f(a,z)
+foo
+2
+hello
+[1,2]
+f(_X_174#18,g(_Y_175#19),_X_174#18)
+a
+f(1,2)
+f(_Y_180) / f(1)
+x
+[1,2]
+prolog: unknown procedure format_not_there/0
+prolog: directive failed: :- _G_183 = format_not_there,call(_G_183)
+ok
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+
+goodbye.

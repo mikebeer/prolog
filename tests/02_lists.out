@@ -1,0 +1,43 @@
+[1,2,3,4]
+[[] - [a,b,c],[a] - [b,c],[a,b] - [c],[a,b,c] - []]
+a
+b
+c
+missing
+3
+[_G11#79,_G11#83,_G11#87]
+[4,3,2,1]
+b / a
+3
+10 / 9 / 2
+[a,c]
+[[1,2,3],[1,3,2],[2,1,3],[2,3,1],[3,1,2],[3,2,1]]
+[b,c]
+[a,a,b,c]
+[a,b,c]
+[1,2,3]
+[2,4,6]
+[2,4]
+[-1,-3]
+[1,2,3,4,5]
+all_positive
+not_all
+abc
+[b,a]
+[a,b]
+[_G11#845,_G11#849] / 2
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+X = a
+     more (;)? X = b
+     more (;)? X = c
+     more (;)? ?-
+prolog: syntax error -- expected end of clause (. or ?) near token <end of input>
+?-
+prolog: syntax error -- expected end of clause (. or ?) near token <end of input>
+?-
+L = [_G11#865,_G11#869]
+     more (;)? ?-
+
+goodbye.

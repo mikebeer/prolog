@@ -1,0 +1,27 @@
+[peter,ann,pat,tom,mike]
+[peter - 7,ann - 11,pat - 8,tom - 5,mike - 11]
+[ann,pat,mike]
+[]
+[5,7,8,11]
+[1 - a,1 - b,2 - a,2 - b]
+[a,b,c]
+[2,4,6,8,10] / 30
+[f(1,_Y_167),f(2,_Y_167)]
+[[1,2]]
+[3]
+prolog: unknown procedure setof/3
+prolog: directive failed: :- setof(_X_176,age(_X_176,_G177),_L_178),writeln(_L_178)
+prolog: unknown procedure bagof/3
+prolog: directive failed: :- bagof(_X_179,age(_X_179,_G180),_L_181),writeln(_L_181)
+prolog: unknown procedure aggregate_all/3
+prolog: directive failed: :- aggregate_all(count,age(_G182,_G183),_C_184),writeln(_C_184)
+5
+2
+42
+a / [b]
+no
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+
+goodbye.

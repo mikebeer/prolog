@@ -1,0 +1,20 @@
+[104,101,108,108,111]
+hello
+[]
+3
+97
+bc
+same
+12
+'it''s'
+say "hi"
+'say "hi"'
+say "hi"
+HELLO
+hi / 2
+done
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+
+goodbye.

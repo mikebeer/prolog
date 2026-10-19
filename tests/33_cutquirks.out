@@ -1,0 +1,18 @@
+[2,none]
+[1,2]
+reached
+[1]
+[1]
+[1]
+prolog: directive failed: :- t7
+prolog: directive failed: :- t7,t7
+[4]
+cut_in_directive
+bare_cut
+1
+[1,1]
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+
+goodbye.

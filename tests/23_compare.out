@@ -1,0 +1,29 @@
+<
+>
+=
+<
+<
+>
+>
+=
+<
+<
+lt
+gt
+num_before_atom
+atom_before_compound
+var_first
+[1.5,3,a,c,f(a),f(b),[115],g(a,b)]
+[a,b,c]
+[a,a,b,b,c]
+[1,2,3]
+[[a],[a,c],[b]]
+[f(1),f(2)]
+[]
+[1 - a,1 - b,2 - a,2 - b]
+3
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+
+goodbye.

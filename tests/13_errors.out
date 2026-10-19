@@ -1,0 +1,86 @@
+prolog: unknown procedure foo/1
+prolog: directive failed: :- foo(1)
+prolog: arithmetic: not evaluable: foo
+prolog: directive failed: :- _X_142 is foo + 1
+prolog: arithmetic: unbound variable
+prolog: directive failed: :- _X_143 is _Y_144 + 1
+prolog: arithmetic: division by zero
+prolog: directive failed: :- _X_145 is 1 / 0
+prolog: arithmetic: division by zero
+prolog: directive failed: :- _X_146 is 5 mod 0
+prolog: arithmetic: division by zero
+prolog: directive failed: :- _X_147 is 5 // 0
+prolog: arithmetic: division by zero
+prolog: directive failed: :- _X_148 is 5 rem 0
+prolog: arithmetic: sqrt of a negative number
+prolog: directive failed: :- _X_149 is sqrt(-4)
+prolog: arithmetic: unknown function cot/1
+prolog: directive failed: :- _X_150 is cot(1)
+prolog: arithmetic: unknown function foo/2
+prolog: directive failed: :- _X_151 is foo(1,2)
+prolog: arithmetic: not evaluable: foo(1,2,3)
+prolog: directive failed: :- _X_152 is foo(1,2,3)
+prolog: unknown procedure 1/0
+prolog: directive failed: :- call(1)
+prolog: instantiation error (unbound goal)
+prolog: directive failed: :- call(_X_153)
+prolog: unknown procedure foo/2
+prolog: directive failed: :- call(foo,1,2)
+prolog: directive failed: :- atom_length(_X_154,3)
+prolog: atom_concat/3: first two arguments must both be bound (split mode is not supported)
+prolog: directive failed: :- atom_concat(_X_155,b,ab)
+prolog: number_codes: not a number: 12x
+prolog: directive failed: :- number_codes(_N_156,[49,50,120])
+prolog: number_chars: not a number: a
+prolog: directive failed: :- number_chars(_N_157,[a])
+prolog: arithmetic: not evaluable: a
+prolog: directive failed: :- 3 > a
+prolog: directive failed: :- fail
+after_failures
+prolog: unknown procedure once/1
+prolog: directive failed: :- once(true)
+prolog: unknown procedure catch/3
+prolog: directive failed: :- catch(true,_G158,true)
+prolog: unknown procedure throw/1
+prolog: directive failed: :- throw(oops)
+prolog: unknown procedure format/1
+prolog: directive failed: :- format([104,101,108,108,111,126,110])
+prolog: unknown procedure halt_not_called/0
+prolog: directive failed: :- halt_not_called
+still_running
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+prolog: syntax error -- unexpected end of clause
+?-
+prolog: syntax error -- expected end of clause (. or ?) near token q
+?-
+prolog: syntax error -- expected end of clause (. or ?) near token <end of input>
+?-
+prolog: syntax error -- expected end of clause (. or ?) near token )
+?-
+prolog: syntax error -- expected ] near ?
+?-
+prolog: syntax error -- expected , or ) near ?
+?-
+prolog: syntax error -- expected end of clause (. or ?) near token <end of input>
+?-
+prolog: unknown procedure nothing/1
+false.
+?-
+prolog: unknown procedure undefined_pred/0
+false.
+?-
+prolog: unknown procedure 3/0
+false.
+?-
+prolog: syntax error -- expected end of clause (. or ?) near token +?
+?-
+true.
+     more (;)? ?-
+prolog: syntax error -- expected end of clause (. or ?) near token bar
+?-
+prolog: unknown session command: )nosuchcommand (try )help)
+?-
+
+goodbye.

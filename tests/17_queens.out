@@ -1,0 +1,11 @@
+[2,4,1,3]
+[[2,4,1,3],[3,1,4,2]]
+10
+[2,4,6,1,3,5]
+[5,3,1,6,4,2]
+solutions(4)
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+
+goodbye.

@@ -1,0 +1,10 @@
+[2,3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59]
+[101,103,107,109,113,127]
+[2,3,5,7,11,13,17,19,23,29,31,37,41,43,47]
+25
+97
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+
+goodbye.

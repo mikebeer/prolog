@@ -19,3 +19,14 @@ save/load, and a small CREXX-facing API for running goals from CREXX programs.
 
 This is the original version. The copy in the CREXX distribution
 (`examples/prolog-in-crexx`) was derived from it and has since diverged.
+
+## C89 port
+
+`c/` holds a strict C89 port of the interpreter with the same top level and
+error messages (see `c/README.md`, and `c/PORTING.md` for VM/370). The shared
+regression corpus is in `tests/` (33 programs, `NAME.pl`, `NAME.in`, `NAME.out`);
+both versions must pass it:
+
+    sh tests/run_tests_crexx.sh         # CREXX version (CREXX_VM=path/to/crexx)
+    cd c && make test                   # C version
+    sh bench/run.sh --crexx; sh bench/run.sh c/prolog   # benchmarks, same checksums

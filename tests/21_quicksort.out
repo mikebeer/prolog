@@ -1,0 +1,13 @@
+[1,1,2,3,3,4,5,5,5,6,9]
+prolog: arithmetic: not evaluable: a
+prolog: arithmetic: not evaluable: b
+prolog: arithmetic: not evaluable: b
+[c,a,b]
+[]
+[1,2,3,6,7,8,9]
+[1,2,3,4,5,6]
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+
+goodbye.

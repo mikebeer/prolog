@@ -1,0 +1,7 @@
+prolog: saved 4 clause(s) to t25_saved.dat
+prolog: saved 6 clause(s) to t25_saved.dat
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+
+goodbye.

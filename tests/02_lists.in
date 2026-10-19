@@ -1,0 +1,8 @@
+member(X, [a, b, c])?
+;
+;
+append(X, Y, [1, 2])?
+;
+;
+length(L, 2)?
+

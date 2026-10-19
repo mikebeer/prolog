@@ -1,0 +1,11 @@
+p(A, B)?
+
+length(L, 2)?
+
+X = f(_, _)?
+
+copy_term(f(A, B), C)?
+
+member(X, [A, B])?
+;
+;

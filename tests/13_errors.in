@@ -1,0 +1,15 @@
+foo(
+p q?
+X = ?
+foo(X))?
+X = [1, 2?
+f(a, b?
+X = 'unterminated?
+nothing(1)?
+undefined_pred?
+call(3)?
+X is 1 +?
+?- true.
+:- write(directive_at_toplevel), nl.
+foo bar.
+)nosuchcommand

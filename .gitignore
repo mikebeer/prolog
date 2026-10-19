@@ -1,0 +1,12 @@
+# CREXX build products
+*.rxbin
+*.rxas
+*.crexx-driver.lock
+# C port binaries and generated deck
+c/prolog
+c/prolog_deck
+c/strict_san*
+c/deck/
+c/*.o
+# files written by the regression tests
+tests/t25_*

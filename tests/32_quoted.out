@@ -1,0 +1,50 @@
+'hello world'
+'Hello'
+hello
+'it''s'
+[]
+[]
+''
+'a.b'
++
++
+/*
+f(' x ')
+hello world
+Hello
+hello
+it's
+[]
+[]
+
+a.b
++
++
+/*
+f( x )
+yes
+no
+['hello world','Hello',hello,'it''s',[],[],'','a.b',+,+,/*,f(' x ')]
+found
+no_unify
+identical
+no_unify
+identical
+p('hello world').
+p('Hello').
+p(hello).
+p('it''s').
+p([]).
+p([]).
+p('').
+p('a.b').
+p(+).
+p(+).
+p(/*).
+p(f(' x ')).
+
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+
+goodbye.

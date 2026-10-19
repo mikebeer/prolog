@@ -1,0 +1,39 @@
+likes(X, wine)?
+;
+;
+likes(john, X), likes(mary, X)?
+
+likes(mary, Y)?
+likes(Z, Z)?
+father(adam, cain).
+father(adam, abel).
+father(adam, X)?
+;
+;
+grandfather(X, Y) :- father(X, Z), father(Z, Y).
+listing?
+)listing
+grandfather(adam, Y)?
+father(X, Y), \+ X = Y?
+;
+;
+X = 1, Y = 2, Z = f(X, Y)?
+
+foo.
+foo?
+bar :- foo.
+bar?
+
+true.
+fail.
+!.
+X = f(Y), Y = 2?
+
+?- X = 5.
+:- Y = 6.
+)help
+)lib nonexistent_directory_xyz
+)clear
+father(adam, X)?
+listing_all?
+)quit

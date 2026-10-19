@@ -1,0 +1,19 @@
+counted_3000
+500500
+300 / 45150
+1 2 3 4 5 
+1 4 9 16 25 
+500
+1
+1
+even
+odd
+111
+1099511627776
+1.15292150460684e+18
+**********
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+
+goodbye.

@@ -1,0 +1,39 @@
+a - _G148#6
+[_G11#7,_G11#11]
+[a,_G11#19,_G11#23] / [_G11#19,_G11#23]
+f(_X_154#27,_Y_155#28,_Z_156#29,_X_154#27)
+f(_FA30,_FA31,_FA32)
+g(_A_160,_B_161)
+[_X_6#33,_X_6#38]
+[1 - _G168,2 - _G168]
+f(_G171,__A_172,__B_173,__A_172)
+[] / [_G176,_G177]
+[_H_2#64] / [_G177]
+[_H_2#64,_H_2#69] / []
+1
+2
+3
+f(_A_179#96,_B_180#97,_A_179#96)
+w(f(_A_179,_B_180,_A_179)).
+
+g(_G183#100,_G184#101)
+_T_186 / _T_186#102
+_Y_189 / _Y_189
+f(_Z_192) / _Z_192 / _Z_192
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+A = a, B = _G148#108
+     more (;)? ?-
+L = [_G11#109,_G11#113]
+     more (;)? ?-
+X = f(_G197,_G198)
+     more (;)? ?-
+A = _A_199, B = _B_200, C = f(_A_199#117,_B_200#118)
+     more (;)? ?-
+X = _X_6#119, A = _X_6#119, B = _B_204
+     more (;)? X = _X_6#124, A = _G9#122, B = _X_6#124
+     more (;)? false.
+?-
+
+goodbye.

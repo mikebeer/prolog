@@ -1,0 +1,16 @@
+move(1,left,right)
+move(2,left,center)
+move(1,right,center)
+move(3,left,right)
+move(1,center,left)
+move(2,center,right)
+move(1,left,right)
+1023
+1048575
+1.15292150460684e+18
+4095
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+
+goodbye.

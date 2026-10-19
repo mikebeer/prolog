@@ -1,0 +1,32 @@
+[tom - ann,tom - pat,bob - jim]
+[bob - liz,liz - bob,ann - pat,pat - ann]
+[bob,liz,ann,pat,jim]
+[pat,tom,bob]
+[pat]
+yes
+no
+bob_has(2)
+3
+grandparent(_X_142,_Z_143) :-
+    parent(_X_142,_Y_144),parent(_Y_144,_Z_143).
+
+parent(tom,bob).
+parent(tom,liz).
+parent(bob,ann).
+parent(bob,pat).
+parent(pat,jim).
+
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+X = bob
+     more (;)? X = liz
+     more (;)? X = ann
+     more (;)? X = pat
+     more (;)? X = jim
+     more (;)? false.
+?-
+X = pat
+     more (;)? ?-
+
+goodbye.

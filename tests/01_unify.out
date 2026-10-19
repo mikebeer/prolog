@@ -1,0 +1,45 @@
+f(a,b) - f(a,b) - a - b
+no
+no
+3 - 3
+differ
+unifiable
+identical
+not_identical
+identical
+differ
+point / 2
+pair(_FA1,_FA2)
+foo / 0
+7 / 0
+b
+no_arg
+[f,a,b]
+g(1,2,3)
+atom
+f(_X_166#3,_Y_167#4,_X_166#3)
+g(1)
+1
+[2,3]
+x / y / [z,w]
+var_ok
+nonvar_ok
+types_ok
+numtypes_ok
+compound_ok
+list_ok
+ground_ok
+equal
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+X = f(_Y_183,_Z_184,_Y_183), Y = _Y_183, Z = _Z_184
+     more (;)? ?-
+A = 1, B = g(_C_187), C = _C_187
+     more (;)? ?-
+T = [c,d]
+     more (;)? ?-
+X = _Y_190, Y = _Y_190
+     more (;)? ?-
+
+goodbye.

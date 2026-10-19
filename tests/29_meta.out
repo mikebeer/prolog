@@ -1,0 +1,20 @@
+3
+15
+[2,3,4]
+[1,4,9,16]
+[11,22]
+2
+hi
+a
+b
+[p,q]
+xx
+17
+prolog: unknown procedure foldl_/4
+prolog: directive failed: :- foldl_(add,[1,2,3,4],0,_S_166),writeln(_S_166)
+prolog: syntax error -- expected , or ) near X
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+
+goodbye.

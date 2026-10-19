@@ -1,0 +1,46 @@
+14
+20
+3
+3 / -3
+1 / 2 / -2
+1 / -1
+1024
+5 / -1 / 0
+7 / 3
+-3 / 3
+lt
+le
+gt_ge
+equal
+not_equal
+10
+3 / 4 / -4 / 4
+2 / -3 / 2
+3 / 3
+10000000000
+123456789000
+2
+0
+8
+5
+counted
+21
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+X = 42
+     more (;)? ?-
+X = 2.5
+     more (;)? ?-
+X = 2
+     more (;)? ?-
+true.
+     more (;)? ?-
+true.
+     more (;)? ?-
+prolog: arithmetic: division by zero
+false.
+?-
+?-
+
+goodbye.
