@@ -2,7 +2,7 @@
 
 static Sym *S_NIL, *S_DOT, *S_COMMA, *S_SEMI, *S_ARROW, *S_NECK, *S_TRUE, *S_FAIL,
            *S_FALSE, *S_BANG, *S_NOTP, *S_NOT, *S_CALL, *S_MINUS, *S_CUT, *S_QUERY,
-           *S_PIPE, *S_EMPTY;
+           *S_PIPE, *S_EMPTY, *S_MSORT, *S_SORT;
 
 static Term **g_trail;
 static long g_tn, g_tcap;

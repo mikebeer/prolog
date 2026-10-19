@@ -14,6 +14,7 @@ typedef struct Term Term;
 typedef struct Sym Sym;
 typedef struct Pred Pred;
 typedef struct Clause Clause;
+typedef struct PIdx PIdx;
 
 enum { T_VAR, T_ATOM, T_QATOM, T_NUM, T_CMP, T_TV, T_CUT };
 
@@ -56,6 +57,7 @@ struct Pred {
   Clause **v;
   int n, cap;
   int listed;
+  PIdx *idx;               /* first-argument index, built on demand (p4_db.c) */
 };
 
 /* text buffer */

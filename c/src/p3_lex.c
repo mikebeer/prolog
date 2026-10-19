@@ -76,6 +76,8 @@ static void init_syms(void)
   S_NOTP = intern("\\+");
   S_NOT = intern("not");
   S_CALL = intern("call");
+  S_MSORT = intern("msort");
+  S_SORT = intern("sort");
   S_MINUS = intern("-");
   S_CUT = intern("$cut");
   S_QUERY = intern("?-");

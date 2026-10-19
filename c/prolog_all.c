@@ -16,6 +16,7 @@ typedef struct Term Term;
 typedef struct Sym Sym;
 typedef struct Pred Pred;
 typedef struct Clause Clause;
+typedef struct PIdx PIdx;
 
 enum { T_VAR, T_ATOM, T_QATOM, T_NUM, T_CMP, T_TV, T_CUT };
 
@@ -58,6 +59,7 @@ struct Pred {
   Clause **v;
   int n, cap;
   int listed;
+  PIdx *idx;               /* first-argument index, built on demand (p4_db.c) */
 };
 
 /* text buffer */
@@ -549,7 +551,7 @@ static int rx_cmp(const char *a, const char *b)
 
 static Sym *S_NIL, *S_DOT, *S_COMMA, *S_SEMI, *S_ARROW, *S_NECK, *S_TRUE, *S_FAIL,
            *S_FALSE, *S_BANG, *S_NOTP, *S_NOT, *S_CALL, *S_MINUS, *S_CUT, *S_QUERY,
-           *S_PIPE, *S_EMPTY;
+           *S_PIPE, *S_EMPTY, *S_MSORT, *S_SORT;
 
 static Term **g_trail;
 static long g_tn, g_tcap;
@@ -1103,6 +1105,8 @@ static void init_syms(void)
   S_NOTP = intern("\\+");
   S_NOT = intern("not");
   S_CALL = intern("call");
+  S_MSORT = intern("msort");
+  S_SORT = intern("sort");
   S_MINUS = intern("-");
   S_CUT = intern("$cut");
   S_QUERY = intern("?-");
@@ -1659,10 +1663,225 @@ static void pred_note_listed(Pred *p)
   g_pltail = p;
 }
 
+/* ---- first-argument index ----------------------------------------------
+   For a predicate with IDX_MIN or more clauses, a call whose first argument is
+   an atom, a number or a compound is resolved through a hash table from the
+   key (atom symbol / numeric value / functor and arity) to the clauses that can
+   match it: those with the same key and those with a variable first argument,
+   in clause order.  A bucket is an array of clauses plus their positions in the
+   predicate; a running call keeps the pointer and the count it started with, so
+   buckets (like the clause arrays) only grow at the end and are never freed.
+   pre[i] is the sum of nhead over clauses 0..i-1: clauses skipped by the index
+   still advance the variable renaming counter g_rvc exactly as trying them
+   would have done (see try_clause in p5_solve.c), so answers and variable
+   names are unchanged.
+   The index describes one snapshot (v, n) of the predicate; assertz keeps it
+   up to date, asserta / retract / reload drop it and it is rebuilt on demand. */
+#ifndef IDX_MIN
+#define IDX_MIN 8
+#endif
+#define IDX_MAXWILD 64
+
+typedef struct { Clause **c; int *pos; int n, cap; } IBkt;
+typedef struct { int kind; const void *p; double d; int ar; IBkt b; } IEnt;  /* kind 0 = free */
+struct PIdx {
+  Clause **v;
+  int n;
+  long *pre;
+  int precap;
+  IEnt *tab;
+  int tcap, tcnt;
+  IBkt wild;
+  int bad;                 /* too many variable-first-argument clauses: do not use */
+};
+
+/* key of a (dereferenced, non-variable) first argument; 0 = no key */
+static int idx_key(Term *t, const void **p, double *d, int *ar)
+{
+  *p = NULL;
+  *d = 0.0;
+  *ar = 0;
+  switch (t->tag) {
+  case T_ATOM: case T_QATOM: *p = t->u.a.sym; return 1;
+  case T_NUM:
+    *d = num_val(t->u.n.txt);
+    if (*d == 0.0) *d = 0.0;
+    return 2;
+  case T_CMP: *p = t->u.c.fn; *ar = t->u.c.ar; return 3;
+  default: return 0;
+  }
+}
+
+static unsigned long idx_hash(int kind, const void *p, double d, int ar)
+{
+  unsigned long h;
+  int e;
+  double m;
+  if (kind == 2) {
+    m = frexp(d, &e);
+    h = (unsigned long)(long)(m * 2147483648.0) * 31UL + (unsigned long)(long)(e + 2000);
+  } else {
+    h = (unsigned long)p;
+    h = (h >> 3) * 2654435761UL + (unsigned long)ar * 40503UL;
+  }
+  return (h ^ (h >> 15)) * 2246822519UL + (unsigned long)kind;
+}
+
+static int idx_first_key(Clause *c, const void **p, double *d, int *ar)
+{
+  Term *a;
+  if (c->head->tag != T_CMP || c->head->u.c.ar < 1) return 0;
+  a = c->head->u.c.args[0];
+  return idx_key(a, p, d, ar);   /* T_TV (variable) gives 0 */
+}
+
+static void ibkt_add(IBkt *b, Clause *c, int pos)
+{
+  if (b->n >= b->cap) {
+    int ncap = b->cap ? b->cap * 2 : 2;
+    Clause **nc = (Clause **)xmalloc(sizeof(Clause *) * (size_t)ncap);
+    int *np = (int *)xmalloc(sizeof(int) * (size_t)ncap);
+    if (b->n) {
+      memcpy(nc, b->c, sizeof(Clause *) * (size_t)b->n);
+      memcpy(np, b->pos, sizeof(int) * (size_t)b->n);
+    }
+    b->c = nc;
+    b->pos = np;
+    b->cap = ncap;
+  }
+  b->c[b->n] = c;
+  b->pos[b->n] = pos;
+  b->n++;
+}
+
+static IEnt *idx_find(PIdx *x, int kind, const void *p, double d, int ar, int create)
+{
+  unsigned long h;
+  int i;
+  if (x->tcap == 0 || (create && (x->tcnt + 1) * 2 > x->tcap)) {
+    int ncap = x->tcap ? x->tcap * 2 : 16, j;
+    IEnt *nt = (IEnt *)xmalloc(sizeof(IEnt) * (size_t)ncap);
+    memset(nt, 0, sizeof(IEnt) * (size_t)ncap);
+    for (j = 0; j < x->tcap; j++) {
+      if (x->tab[j].kind) {
+        h = idx_hash(x->tab[j].kind, x->tab[j].p, x->tab[j].d, x->tab[j].ar);
+        i = (int)(h & (unsigned long)(ncap - 1));
+        while (nt[i].kind) i = (i + 1) & (ncap - 1);
+        nt[i] = x->tab[j];
+      }
+    }
+    free(x->tab);   /* entries are copied by value; running calls hold bucket arrays only */
+    x->tab = nt;
+    x->tcap = ncap;
+  }
+  h = idx_hash(kind, p, d, ar);
+  i = (int)(h & (unsigned long)(x->tcap - 1));
+  while (x->tab[i].kind) {
+    IEnt *e = &x->tab[i];
+    if (e->kind == kind && e->p == p && e->ar == ar && (kind != 2 || e->d == d)) return e;
+    i = (i + 1) & (x->tcap - 1);
+  }
+  if (!create) return NULL;
+  x->tab[i].kind = kind;
+  x->tab[i].p = p;
+  x->tab[i].d = d;
+  x->tab[i].ar = ar;
+  x->tab[i].b.c = NULL;
+  x->tab[i].b.pos = NULL;
+  x->tab[i].b.n = x->tab[i].b.cap = 0;
+  x->tcnt++;
+  return &x->tab[i];
+}
+
+/* a new bucket starts as a copy of the variable-first-argument clauses before it */
+static void idx_new_bucket(PIdx *x, IEnt *e)
+{
+  int i;
+  for (i = 0; i < x->wild.n; i++) ibkt_add(&e->b, x->wild.c[i], x->wild.pos[i]);
+}
+
+/* add clause c at position pos; returns 0 when the index must be dropped */
+static int idx_append(PIdx *x, Clause *c, int pos)
+{
+  const void *p;
+  double d;
+  int ar, kind, i;
+  if (pos + 2 > x->precap) {
+    int ncap = x->precap ? x->precap * 2 : 16;
+    long *np = (long *)xmalloc(sizeof(long) * (size_t)ncap);
+    if (x->precap) memcpy(np, x->pre, sizeof(long) * (size_t)x->precap);
+    x->pre = np;
+    x->precap = ncap;
+  }
+  if (pos == 0) x->pre[0] = 0;
+  x->pre[pos + 1] = x->pre[pos] + c->nhead;
+  kind = idx_first_key(c, &p, &d, &ar);
+  if (kind == 0) {
+    if (x->wild.n >= IDX_MAXWILD || (long)x->tcnt * (x->wild.n + 1) > 4096L) return 0;
+    ibkt_add(&x->wild, c, pos);
+    for (i = 0; i < x->tcap; i++)
+      if (x->tab[i].kind) ibkt_add(&x->tab[i].b, c, pos);
+  } else {
+    IEnt *e = idx_find(x, kind, p, d, ar, 0);
+    if (e == NULL) {
+      e = idx_find(x, kind, p, d, ar, 1);
+      idx_new_bucket(x, e);
+    }
+    ibkt_add(&e->b, c, pos);
+  }
+  x->n = pos + 1;
+  return 1;
+}
+
+static PIdx *idx_build(Pred *p)
+{
+  PIdx *x = (PIdx *)xmalloc(sizeof(PIdx));
+  int i;
+  memset(x, 0, sizeof(PIdx));
+  x->v = p->v;
+  for (i = 0; i < p->n; i++) {
+    if (!idx_append(x, p->v[i], i)) {
+      x->bad = 1;
+      break;
+    }
+  }
+  x->n = p->n;
+  return x;
+}
+
+/* the candidate clauses for a call of p with first argument a (dereferenced);
+   NULL when the predicate is too small or the argument is a variable */
+static PIdx *idx_for_call(Pred *p, Term *a, IBkt **bk)
+{
+  const void *kp;
+  double d;
+  int ar, kind;
+  PIdx *x;
+  IEnt *e;
+  static IBkt none;
+  if (p->n < IDX_MIN) return NULL;
+  kind = idx_key(a, &kp, &d, &ar);
+  if (kind == 0) return NULL;
+  x = p->idx;
+  if (x == NULL || x->v != p->v || x->n != p->n) {
+    x = idx_build(p);
+    p->idx = x;
+  }
+  if (x->bad) return NULL;
+  e = idx_find(x, kind, kp, d, ar, 0);
+  if (e != NULL) *bk = &e->b;
+  else if (x->wild.n > 0) *bk = &x->wild;
+  else *bk = &none;
+  return x;
+}
+
+
 /* a snapshot of the clause list stays valid while clauses are added */
 static void pred_add(Pred *p, Clause *c, int atz)
 {
+  int keep = atz && p->idx != NULL && !p->idx->bad && p->idx->v == p->v && p->idx->n == p->n;
   pred_note_listed(p);
+  if (!keep) p->idx = NULL;
   if (atz) {
     if (p->n < p->cap) {
       p->v[p->n++] = c;
@@ -1683,6 +1902,10 @@ static void pred_add(Pred *p, Clause *c, int atz)
     p->n++;
     p->cap = p->n + 3;
   }
+  if (keep) {
+    p->idx->v = p->v;
+    if (!idx_append(p->idx, c, p->n - 1)) p->idx = NULL;
+  }
 }
 
 static void pred_set(Pred *p, Clause **keep, int n)
@@ -1692,7 +1915,9 @@ static void pred_set(Pred *p, Clause **keep, int n)
   p->v = nv;
   p->n = n;
   p->cap = n + 4;
+  p->idx = NULL;
 }
+
 
 /* ---- templates ---- */
 typedef struct { Term **v; int n, cap; } VList;
@@ -2256,6 +2481,9 @@ typedef struct Frame {
   Term *a, *b;
   Clause **v;
   int n, i;
+  int *ipos;               /* indexed call: original positions of v[] */
+  long *pre;               /* index: prefix sums of nhead */
+  int last, norig;         /* index: last position entered, clauses in the snapshot */
   long barrier;
   FAcc *fa, *savedfa;
   Term *tmpl, *savedtmpl;
@@ -2271,6 +2499,22 @@ static Term *g_fatmpl;
 static long g_fapos;
 
 static int bi_exec(int id, Term *goal);
+static int bi_sort_list(Term *goal, int dedupe);
+#ifndef NSORT_MIN
+#define NSORT_MIN 32
+#endif
+
+/* length of a proper list, -1 if the term is not one */
+static long proper_list_len(Term *t)
+{
+  long n = 0;
+  t = deref(t);
+  while (t->tag == T_CMP && t->u.c.fn == S_DOT && t->u.c.ar == 2) {
+    n++;
+    t = deref(t->u.c.args[1]);
+  }
+  return t == S_NIL->pt ? n : -1;
+}
 static int on_solution(void);
 #define BI_FINDALL_ID 1
 
@@ -2529,6 +2773,18 @@ eval:
     else { v = 0; goto ret; }
     goto eval;
   }
+  /* msort/2 and sort/2 of a long proper list: merge sort in C instead of the insertion sort
+     of the library (quadratic).  Short lists keep the library path so that the variable
+     renaming counters stay exactly as before. */
+  if (ar == 2 && (fn == S_MSORT || fn == S_SORT)) {
+    pr = pred_find(fn, ar, 0);
+    if (pr != NULL && pr->n > 0 && pr->v[0]->id <= g_bootmax && pr->v[pr->n - 1]->id <= g_bootmax &&
+        proper_list_len(goal->u.c.args[0]) >= NSORT_MIN) {
+      if (bi_sort_list(goal, fn == S_SORT)) goals = rest;
+      else { v = 0; goto ret; }
+      goto eval;
+    }
+  }
   /* a user predicate */
   pr = pred_find(fn, ar, 0);
   if (pr == NULL || pr->n == 0) {
@@ -2548,11 +2804,25 @@ eval:
   fp->v = pr->v;
   fp->n = pr->n;
   fp->i = 0;
+  fp->ipos = NULL;
   fp->barrier = ++g_callcount;
+  if (ar >= 1 && pr->n >= IDX_MIN) {
+    IBkt *bk = NULL;
+    PIdx *ix = idx_for_call(pr, deref(goal->u.c.args[0]), &bk);
+    if (ix != NULL) {
+      fp->v = bk->c;
+      fp->n = bk->n;
+      fp->ipos = bk->pos;
+      fp->pre = ix->pre;
+      fp->last = -1;
+      fp->norig = pr->n;
+    }
+  }
 
 try_clause:
   fp = &g_stk[g_sp - 1];
   if (fp->i >= fp->n) {
+    if (fp->ipos != NULL) g_rvc += fp->pre[fp->norig] - fp->pre[fp->last + 1];
     g_sp--;
     v = 0;
     goto ret;
@@ -2560,6 +2830,10 @@ try_clause:
   fp->tmark = trail_mark();
   fp->hmark = amark(&g_heap);
   cl = fp->v[fp->i];
+  if (fp->ipos != NULL) {   /* clauses skipped by the index still use up renaming numbers */
+    g_rvc += fp->pre[fp->ipos[fp->i]] - fp->pre[fp->last + 1];
+    fp->last = fp->ipos[fp->i];
+  }
   fr = (Term **)aalloc(&g_heap, sizeof(Term *) * (size_t)(cl->nvars + 1));
   for (k = 0; k < cl->nvars; k++) fr[k] = NULL;
   cbase = g_rvc;
@@ -3113,6 +3387,53 @@ static int int_valued(Term *v)
   return v->tag == T_NUM && num_val(v->u.n.txt) == num_val(trunc_text(v->u.n.txt));
 }
 
+/* stable bottom-up merge sort of terms in standard order */
+static void sort_terms(Term **v, int n)
+{
+  Term **tmp;
+  int w, i, j, k, m, mid, hi;
+  if (n < 2) return;
+  tmp = (Term **)xmalloc(sizeof(Term *) * (size_t)n);
+  for (w = 1; w < n; w *= 2) {
+    for (i = 0; i < n; i += 2 * w) {
+      mid = i + w < n ? i + w : n;
+      hi = i + 2 * w < n ? i + 2 * w : n;
+      j = i;
+      k = mid;
+      m = i;
+      while (j < mid && k < hi) {
+        if (term_compare(v[k], v[j]) < 0) tmp[m++] = v[k++];
+        else tmp[m++] = v[j++];
+      }
+      while (j < mid) tmp[m++] = v[j++];
+      while (k < hi) tmp[m++] = v[k++];
+    }
+    memcpy(v, tmp, sizeof(Term *) * (size_t)n);
+  }
+  free(tmp);
+}
+
+/* msort/2 and sort/2 on a proper list (called from the solver for long lists); sort/2 also
+   drops duplicates (term_compare == 0), keeping the last of each run like the library did */
+static int bi_sort_list(Term *goal, int dedupe)
+{
+  Term **v, *r;
+  int n, i, m;
+  n = list_items(goal->u.c.args[0], &v);
+  sort_terms(v, n);
+  m = n;
+  if (dedupe && n > 1) {
+    m = 0;
+    for (i = 0; i < n; i++) {
+      if (i + 1 < n && term_compare(v[i], v[i + 1]) == 0) continue;
+      v[m++] = v[i];
+    }
+  }
+  r = S_NIL->pt;
+  for (i = m; i > 0; i--) r = mk_cons(v[i - 1], r);
+  return unify(goal->u.c.args[1], r);
+}
+
 static int bi_exec(int id, Term *goal)
 {
   Term **A = goal->tag == T_CMP ? goal->u.c.args : NULL;
@@ -3465,6 +3786,7 @@ static void init_engine(void)
       for (p = y->preds; p; p = p->next) {
         p->n = 0;
         p->listed = 0;
+        p->idx = NULL;
         p->lnext = NULL;
       }
   }

@@ -414,6 +414,53 @@ static int int_valued(Term *v)
   return v->tag == T_NUM && num_val(v->u.n.txt) == num_val(trunc_text(v->u.n.txt));
 }
 
+/* stable bottom-up merge sort of terms in standard order */
+static void sort_terms(Term **v, int n)
+{
+  Term **tmp;
+  int w, i, j, k, m, mid, hi;
+  if (n < 2) return;
+  tmp = (Term **)xmalloc(sizeof(Term *) * (size_t)n);
+  for (w = 1; w < n; w *= 2) {
+    for (i = 0; i < n; i += 2 * w) {
+      mid = i + w < n ? i + w : n;
+      hi = i + 2 * w < n ? i + 2 * w : n;
+      j = i;
+      k = mid;
+      m = i;
+      while (j < mid && k < hi) {
+        if (term_compare(v[k], v[j]) < 0) tmp[m++] = v[k++];
+        else tmp[m++] = v[j++];
+      }
+      while (j < mid) tmp[m++] = v[j++];
+      while (k < hi) tmp[m++] = v[k++];
+    }
+    memcpy(v, tmp, sizeof(Term *) * (size_t)n);
+  }
+  free(tmp);
+}
+
+/* msort/2 and sort/2 on a proper list (called from the solver for long lists); sort/2 also
+   drops duplicates (term_compare == 0), keeping the last of each run like the library did */
+static int bi_sort_list(Term *goal, int dedupe)
+{
+  Term **v, *r;
+  int n, i, m;
+  n = list_items(goal->u.c.args[0], &v);
+  sort_terms(v, n);
+  m = n;
+  if (dedupe && n > 1) {
+    m = 0;
+    for (i = 0; i < n; i++) {
+      if (i + 1 < n && term_compare(v[i], v[i + 1]) == 0) continue;
+      v[m++] = v[i];
+    }
+  }
+  r = S_NIL->pt;
+  for (i = m; i > 0; i--) r = mk_cons(v[i - 1], r);
+  return unify(goal->u.c.args[1], r);
+}
+
 static int bi_exec(int id, Term *goal)
 {
   Term **A = goal->tag == T_CMP ? goal->u.c.args : NULL;

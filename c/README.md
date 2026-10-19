@@ -68,6 +68,29 @@ stack. Differences:
   `a b(1)`. Escapes such as `'\n'` crash CREXX but work in C.
 * `crexx_call/2,3` is a stub that knows `hello` and `double`.
 
+## Sorting and the clause index
+
+* `msort/2` and `sort/2` of a proper list of 32 or more elements are done by a stable
+  merge sort in C (`bi_sort_list` in `p6_bi.c`, called from the solver); the library
+  insertion sort in `p7_main.c` is quadratic and took more than 13 s at N = 50,000.
+  50,000 elements now take 0.4 s, 200,000 take about 1.5 s. Shorter lists, partial
+  lists and non-lists still use the library clauses, so answers and the variable
+  renaming counters are unchanged for every program that does not sort a long list.
+  `sort/2` keeps the last of each run of terms that compare equal, as the library did.
+  `predsort/3` and `keysort/2` do not exist (test 14 checks the error).
+* First-argument indexing (`p4_db.c`): a predicate with 8 or more clauses called with an
+  atom, number or compound first argument is resolved through a hash table
+  (atom / numeric value / functor and arity -> the matching clauses plus those with a
+  variable first argument, in order). Lookup of asserted facts is O(1) on average
+  instead of a scan: 20,000 `assertz(kv(K,V))` followed by 20,000 `kv(K,V)` calls take
+  0.2 s (16 s before). `assertz` keeps the index current; `asserta`, `retract` and
+  reload drop it and it is rebuilt on the next call. Clauses skipped by the index still
+  advance the renaming counter by what trying them would have used, so printed variable
+  names (`_G12`, `_X_3#17`) and answer order are identical with and without the index
+  (checked on randomly generated programs). `-DIDX_MIN=n` / `-DNSORT_MIN=n` change the thresholds.
+* `tests/c_only/big.pl` (C version only): sorts of 50,000 and 200,000 numbers, duplicates,
+  and a 100,000-fact table with variable and repeated first arguments.
+
 ## Cross-check with SWI-Prolog
 
 The pure-logic programs of the corpus (queens, zebra, primes) give the same

@@ -24,5 +24,16 @@ for src in "$ROOT"/tests/*.pl; do
     fi
   fi
 done
+# C-only tests (tests/c_only/NAME.pl, expected NAME.out): long sorts, first-argument index
+for src in "$DIR"/c_only/*.pl; do
+  [ -f "$src" ] || continue
+  name=c_only/$(basename "$src" .pl)
+  actual=$(cd "$DIR/c_only" && timeout 300 "$PL" "$(basename "$src")" < /dev/null 2>&1)
+  if [ "$actual" = "$(cat "${src%.pl}.out")" ]; then
+    pass=$((pass+1)); echo "ok   $name"
+  else
+    fail=$((fail+1)); echo "FAIL $name"
+  fi
+done
 echo "passed $pass, failed $fail, skipped $skip"
 [ "$fail" -eq 0 ]

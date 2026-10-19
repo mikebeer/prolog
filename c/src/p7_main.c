@@ -89,6 +89,7 @@ static void init_engine(void)
       for (p = y->preds; p; p = p->next) {
         p->n = 0;
         p->listed = 0;
+        p->idx = NULL;
         p->lnext = NULL;
       }
   }

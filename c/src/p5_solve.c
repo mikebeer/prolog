@@ -203,6 +203,9 @@ typedef struct Frame {
   Term *a, *b;
   Clause **v;
   int n, i;
+  int *ipos;               /* indexed call: original positions of v[] */
+  long *pre;               /* index: prefix sums of nhead */
+  int last, norig;         /* index: last position entered, clauses in the snapshot */
   long barrier;
   FAcc *fa, *savedfa;
   Term *tmpl, *savedtmpl;
@@ -218,6 +221,22 @@ static Term *g_fatmpl;
 static long g_fapos;
 
 static int bi_exec(int id, Term *goal);
+static int bi_sort_list(Term *goal, int dedupe);
+#ifndef NSORT_MIN
+#define NSORT_MIN 32
+#endif
+
+/* length of a proper list, -1 if the term is not one */
+static long proper_list_len(Term *t)
+{
+  long n = 0;
+  t = deref(t);
+  while (t->tag == T_CMP && t->u.c.fn == S_DOT && t->u.c.ar == 2) {
+    n++;
+    t = deref(t->u.c.args[1]);
+  }
+  return t == S_NIL->pt ? n : -1;
+}
 static int on_solution(void);
 #define BI_FINDALL_ID 1
 
@@ -476,6 +495,18 @@ eval:
     else { v = 0; goto ret; }
     goto eval;
   }
+  /* msort/2 and sort/2 of a long proper list: merge sort in C instead of the insertion sort
+     of the library (quadratic).  Short lists keep the library path so that the variable
+     renaming counters stay exactly as before. */
+  if (ar == 2 && (fn == S_MSORT || fn == S_SORT)) {
+    pr = pred_find(fn, ar, 0);
+    if (pr != NULL && pr->n > 0 && pr->v[0]->id <= g_bootmax && pr->v[pr->n - 1]->id <= g_bootmax &&
+        proper_list_len(goal->u.c.args[0]) >= NSORT_MIN) {
+      if (bi_sort_list(goal, fn == S_SORT)) goals = rest;
+      else { v = 0; goto ret; }
+      goto eval;
+    }
+  }
   /* a user predicate */
   pr = pred_find(fn, ar, 0);
   if (pr == NULL || pr->n == 0) {
@@ -495,11 +526,25 @@ eval:
   fp->v = pr->v;
   fp->n = pr->n;
   fp->i = 0;
+  fp->ipos = NULL;
   fp->barrier = ++g_callcount;
+  if (ar >= 1 && pr->n >= IDX_MIN) {
+    IBkt *bk = NULL;
+    PIdx *ix = idx_for_call(pr, deref(goal->u.c.args[0]), &bk);
+    if (ix != NULL) {
+      fp->v = bk->c;
+      fp->n = bk->n;
+      fp->ipos = bk->pos;
+      fp->pre = ix->pre;
+      fp->last = -1;
+      fp->norig = pr->n;
+    }
+  }
 
 try_clause:
   fp = &g_stk[g_sp - 1];
   if (fp->i >= fp->n) {
+    if (fp->ipos != NULL) g_rvc += fp->pre[fp->norig] - fp->pre[fp->last + 1];
     g_sp--;
     v = 0;
     goto ret;
@@ -507,6 +552,10 @@ try_clause:
   fp->tmark = trail_mark();
   fp->hmark = amark(&g_heap);
   cl = fp->v[fp->i];
+  if (fp->ipos != NULL) {   /* clauses skipped by the index still use up renaming numbers */
+    g_rvc += fp->pre[fp->ipos[fp->i]] - fp->pre[fp->last + 1];
+    fp->last = fp->ipos[fp->i];
+  }
   fr = (Term **)aalloc(&g_heap, sizeof(Term *) * (size_t)(cl->nvars + 1));
   for (k = 0; k < cl->nvars; k++) fr[k] = NULL;
   cbase = g_rvc;

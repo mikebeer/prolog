@@ -30,10 +30,225 @@ static void pred_note_listed(Pred *p)
   g_pltail = p;
 }
 
+/* ---- first-argument index ----------------------------------------------
+   For a predicate with IDX_MIN or more clauses, a call whose first argument is
+   an atom, a number or a compound is resolved through a hash table from the
+   key (atom symbol / numeric value / functor and arity) to the clauses that can
+   match it: those with the same key and those with a variable first argument,
+   in clause order.  A bucket is an array of clauses plus their positions in the
+   predicate; a running call keeps the pointer and the count it started with, so
+   buckets (like the clause arrays) only grow at the end and are never freed.
+   pre[i] is the sum of nhead over clauses 0..i-1: clauses skipped by the index
+   still advance the variable renaming counter g_rvc exactly as trying them
+   would have done (see try_clause in p5_solve.c), so answers and variable
+   names are unchanged.
+   The index describes one snapshot (v, n) of the predicate; assertz keeps it
+   up to date, asserta / retract / reload drop it and it is rebuilt on demand. */
+#ifndef IDX_MIN
+#define IDX_MIN 8
+#endif
+#define IDX_MAXWILD 64
+
+typedef struct { Clause **c; int *pos; int n, cap; } IBkt;
+typedef struct { int kind; const void *p; double d; int ar; IBkt b; } IEnt;  /* kind 0 = free */
+struct PIdx {
+  Clause **v;
+  int n;
+  long *pre;
+  int precap;
+  IEnt *tab;
+  int tcap, tcnt;
+  IBkt wild;
+  int bad;                 /* too many variable-first-argument clauses: do not use */
+};
+
+/* key of a (dereferenced, non-variable) first argument; 0 = no key */
+static int idx_key(Term *t, const void **p, double *d, int *ar)
+{
+  *p = NULL;
+  *d = 0.0;
+  *ar = 0;
+  switch (t->tag) {
+  case T_ATOM: case T_QATOM: *p = t->u.a.sym; return 1;
+  case T_NUM:
+    *d = num_val(t->u.n.txt);
+    if (*d == 0.0) *d = 0.0;
+    return 2;
+  case T_CMP: *p = t->u.c.fn; *ar = t->u.c.ar; return 3;
+  default: return 0;
+  }
+}
+
+static unsigned long idx_hash(int kind, const void *p, double d, int ar)
+{
+  unsigned long h;
+  int e;
+  double m;
+  if (kind == 2) {
+    m = frexp(d, &e);
+    h = (unsigned long)(long)(m * 2147483648.0) * 31UL + (unsigned long)(long)(e + 2000);
+  } else {
+    h = (unsigned long)p;
+    h = (h >> 3) * 2654435761UL + (unsigned long)ar * 40503UL;
+  }
+  return (h ^ (h >> 15)) * 2246822519UL + (unsigned long)kind;
+}
+
+static int idx_first_key(Clause *c, const void **p, double *d, int *ar)
+{
+  Term *a;
+  if (c->head->tag != T_CMP || c->head->u.c.ar < 1) return 0;
+  a = c->head->u.c.args[0];
+  return idx_key(a, p, d, ar);   /* T_TV (variable) gives 0 */
+}
+
+static void ibkt_add(IBkt *b, Clause *c, int pos)
+{
+  if (b->n >= b->cap) {
+    int ncap = b->cap ? b->cap * 2 : 2;
+    Clause **nc = (Clause **)xmalloc(sizeof(Clause *) * (size_t)ncap);
+    int *np = (int *)xmalloc(sizeof(int) * (size_t)ncap);
+    if (b->n) {
+      memcpy(nc, b->c, sizeof(Clause *) * (size_t)b->n);
+      memcpy(np, b->pos, sizeof(int) * (size_t)b->n);
+    }
+    b->c = nc;
+    b->pos = np;
+    b->cap = ncap;
+  }
+  b->c[b->n] = c;
+  b->pos[b->n] = pos;
+  b->n++;
+}
+
+static IEnt *idx_find(PIdx *x, int kind, const void *p, double d, int ar, int create)
+{
+  unsigned long h;
+  int i;
+  if (x->tcap == 0 || (create && (x->tcnt + 1) * 2 > x->tcap)) {
+    int ncap = x->tcap ? x->tcap * 2 : 16, j;
+    IEnt *nt = (IEnt *)xmalloc(sizeof(IEnt) * (size_t)ncap);
+    memset(nt, 0, sizeof(IEnt) * (size_t)ncap);
+    for (j = 0; j < x->tcap; j++) {
+      if (x->tab[j].kind) {
+        h = idx_hash(x->tab[j].kind, x->tab[j].p, x->tab[j].d, x->tab[j].ar);
+        i = (int)(h & (unsigned long)(ncap - 1));
+        while (nt[i].kind) i = (i + 1) & (ncap - 1);
+        nt[i] = x->tab[j];
+      }
+    }
+    free(x->tab);   /* entries are copied by value; running calls hold bucket arrays only */
+    x->tab = nt;
+    x->tcap = ncap;
+  }
+  h = idx_hash(kind, p, d, ar);
+  i = (int)(h & (unsigned long)(x->tcap - 1));
+  while (x->tab[i].kind) {
+    IEnt *e = &x->tab[i];
+    if (e->kind == kind && e->p == p && e->ar == ar && (kind != 2 || e->d == d)) return e;
+    i = (i + 1) & (x->tcap - 1);
+  }
+  if (!create) return NULL;
+  x->tab[i].kind = kind;
+  x->tab[i].p = p;
+  x->tab[i].d = d;
+  x->tab[i].ar = ar;
+  x->tab[i].b.c = NULL;
+  x->tab[i].b.pos = NULL;
+  x->tab[i].b.n = x->tab[i].b.cap = 0;
+  x->tcnt++;
+  return &x->tab[i];
+}
+
+/* a new bucket starts as a copy of the variable-first-argument clauses before it */
+static void idx_new_bucket(PIdx *x, IEnt *e)
+{
+  int i;
+  for (i = 0; i < x->wild.n; i++) ibkt_add(&e->b, x->wild.c[i], x->wild.pos[i]);
+}
+
+/* add clause c at position pos; returns 0 when the index must be dropped */
+static int idx_append(PIdx *x, Clause *c, int pos)
+{
+  const void *p;
+  double d;
+  int ar, kind, i;
+  if (pos + 2 > x->precap) {
+    int ncap = x->precap ? x->precap * 2 : 16;
+    long *np = (long *)xmalloc(sizeof(long) * (size_t)ncap);
+    if (x->precap) memcpy(np, x->pre, sizeof(long) * (size_t)x->precap);
+    x->pre = np;
+    x->precap = ncap;
+  }
+  if (pos == 0) x->pre[0] = 0;
+  x->pre[pos + 1] = x->pre[pos] + c->nhead;
+  kind = idx_first_key(c, &p, &d, &ar);
+  if (kind == 0) {
+    if (x->wild.n >= IDX_MAXWILD || (long)x->tcnt * (x->wild.n + 1) > 4096L) return 0;
+    ibkt_add(&x->wild, c, pos);
+    for (i = 0; i < x->tcap; i++)
+      if (x->tab[i].kind) ibkt_add(&x->tab[i].b, c, pos);
+  } else {
+    IEnt *e = idx_find(x, kind, p, d, ar, 0);
+    if (e == NULL) {
+      e = idx_find(x, kind, p, d, ar, 1);
+      idx_new_bucket(x, e);
+    }
+    ibkt_add(&e->b, c, pos);
+  }
+  x->n = pos + 1;
+  return 1;
+}
+
+static PIdx *idx_build(Pred *p)
+{
+  PIdx *x = (PIdx *)xmalloc(sizeof(PIdx));
+  int i;
+  memset(x, 0, sizeof(PIdx));
+  x->v = p->v;
+  for (i = 0; i < p->n; i++) {
+    if (!idx_append(x, p->v[i], i)) {
+      x->bad = 1;
+      break;
+    }
+  }
+  x->n = p->n;
+  return x;
+}
+
+/* the candidate clauses for a call of p with first argument a (dereferenced);
+   NULL when the predicate is too small or the argument is a variable */
+static PIdx *idx_for_call(Pred *p, Term *a, IBkt **bk)
+{
+  const void *kp;
+  double d;
+  int ar, kind;
+  PIdx *x;
+  IEnt *e;
+  static IBkt none;
+  if (p->n < IDX_MIN) return NULL;
+  kind = idx_key(a, &kp, &d, &ar);
+  if (kind == 0) return NULL;
+  x = p->idx;
+  if (x == NULL || x->v != p->v || x->n != p->n) {
+    x = idx_build(p);
+    p->idx = x;
+  }
+  if (x->bad) return NULL;
+  e = idx_find(x, kind, kp, d, ar, 0);
+  if (e != NULL) *bk = &e->b;
+  else if (x->wild.n > 0) *bk = &x->wild;
+  else *bk = &none;
+  return x;
+}
+
+
 /* a snapshot of the clause list stays valid while clauses are added */
 static void pred_add(Pred *p, Clause *c, int atz)
 {
+  int keep = atz && p->idx != NULL && !p->idx->bad && p->idx->v == p->v && p->idx->n == p->n;
   pred_note_listed(p);
+  if (!keep) p->idx = NULL;
   if (atz) {
     if (p->n < p->cap) {
       p->v[p->n++] = c;
@@ -54,6 +269,10 @@ static void pred_add(Pred *p, Clause *c, int atz)
     p->n++;
     p->cap = p->n + 3;
   }
+  if (keep) {
+    p->idx->v = p->v;
+    if (!idx_append(p->idx, c, p->n - 1)) p->idx = NULL;
+  }
 }
 
 static void pred_set(Pred *p, Clause **keep, int n)
@@ -63,7 +282,9 @@ static void pred_set(Pred *p, Clause **keep, int n)
   p->v = nv;
   p->n = n;
   p->cap = n + 4;
+  p->idx = NULL;
 }
+
 
 /* ---- templates ---- */
 typedef struct { Term **v; int n, cap; } VList;
