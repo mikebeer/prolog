@@ -77,6 +77,7 @@ static void init_engine(void)
   g_callcount = 0;
   g_fa = NULL;
   g_fatmpl = NULL;
+  g_tombn = g_tbase = 0;
   if (g_heap.n > 0) {
     AMark z;
     z.blk = 0;
@@ -87,6 +88,12 @@ static void init_engine(void)
     Sym *y;
     for (y = g_symtab[i]; y; y = y->next)
       for (p = y->preds; p; p = p->next) {
+        int k;
+        for (k = 0; k < p->n; k++) zombie_clause(p->v[k]);
+        zombie_arr(p->v, sizeof(Clause *) * (size_t)p->cap);
+        zombie_idx(p->idx);
+        p->v = NULL;
+        p->cap = 0;
         p->n = 0;
         p->listed = 0;
         p->idx = NULL;
@@ -232,7 +239,10 @@ static int handle_syscmd(char *ln)
     say("prolog: workspace cleared.");
   } else if (strcmp(up, ")LIB") == 0) sys_lib(strip_blanks(rest));
   else if (strcmp(up, ")HELP") == 0 || strcmp(up, ")?") == 0) sys_help();
-  else if (strcmp(up, ")QUIT") == 0 || strcmp(up, ")EXIT") == 0) return 1;
+  else if (strcmp(up, ")GC") == 0) {
+    gc_collect(NULL);
+    gc_stats();
+  } else if (strcmp(up, ")QUIT") == 0 || strcmp(up, ")EXIT") == 0) return 1;
   else {
     charout("prolog: unknown session command: ");
     charout(cmd);
@@ -277,7 +287,9 @@ static void solve_interact_show(Term *g)
   vmap_copy(&g_qvarmap, &g_pvarmap);
   g_mode = M_INTERACT;
   mark = trail_mark();
+  groot(GR_TMARK, &mark);
   ok = run(new_goal(g, NULL));
+  g_nroots--;
   g_mode = M_FIRST;
   if (!ok) say("false.");
   trail_undo(mark);
@@ -327,6 +339,7 @@ static void run_top_level(void)
       continue;
     }
     hm = amark(&g_heap);
+    groot(GR_AMARK, &hm);
     tokenize(ln);
     while (g_ppos < g_ntok) {
       Term *goal = parse_clause();
@@ -345,12 +358,32 @@ static void run_top_level(void)
       }
     }
     free(raw);
+    g_nroots--;
     arelease(&g_heap, hm);
+  }
+}
+
+/* PROLOG_GC: comma separated off | stress=N | verbose | noelide (see README.md) */
+static void gc_options(void)
+{
+  const char *e = getenv("PROLOG_GC"), *p;
+  if (e == NULL) return;
+  for (p = e; *p; ) {
+    if (strncmp(p, "off", 3) == 0) g_gc_on = 0;
+    else if (strncmp(p, "verbose", 7) == 0) g_gc_verbose = 1;
+    else if (strncmp(p, "noelide", 7) == 0) g_elide = 0;
+    else if (strncmp(p, "stress", 6) == 0) {
+      g_gc_stress = p[6] == '=' ? atol(p + 7) : 1;
+      if (g_gc_stress < 1) g_gc_stress = 1;
+    }
+    while (*p && *p != ',') p++;
+    if (*p == ',') p++;
   }
 }
 
 int main(int argc, char **argv)
 {
+  gc_options();
   init_syms();
   init_ops();
   init_builtins();

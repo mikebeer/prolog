@@ -741,6 +741,38 @@ Documented on purpose, not discovered by accident:
 - **A `-` glued to a number is always a literal**, never subtraction —
   see the note at the end of [§4](#4-language-reference).
 
+### Memory in the C version (`c/`)
+
+The C port reclaims memory while a program runs, so long deterministic
+loops — `count(N) :- N > 0, N1 is N - 1, count(N1).` for ten million
+steps, a counter kept with `retract`/`assertz`, an accumulator passed down
+a recursion — run in a few megabytes. Backtracking still frees memory
+immediately; the garbage collector handles what deterministic code leaves
+behind:
+
+- a call whose last possible clause has been entered no longer keeps its
+  stack frame, and a cut removes the alternatives it cuts at once;
+- when the heap has grown past twice what was live after the previous
+  collection (at least 4 MB), the live terms are copied together (in their
+  original order, so backtracking still works) and the rest is freed; trail
+  entries of unreachable variables are dropped and chains of bound
+  variables are shortened;
+- retracted clauses are freed once no running call can still try them and
+  no term still points into them.
+
+Answers, their order and the generated variable names (`_G12`,
+`_X_3#17`) are exactly the same with and without the collector.
+
+Controls (C version only): `garbage_collect/0` collects now;
+`statistics/0` prints the collector's counters; `gc(off)` / `gc(on)`
+switch automatic collection off and on; `gc(N)` collects every N
+inferences (a stress test); the session command `)gc` collects and prints
+the counters; the environment variable `PROLOG_GC` takes `off`,
+`stress=N`, `verbose` and `noelide`. Limits: a choice point keeps
+everything it could backtrack to (a loop that leaves one per step still
+grows), non-tail recursion keeps its pending goals, and atoms are never
+freed. Details are in `c/README.md`.
+
 ---
 
 ## 7. Troubleshooting and Tips

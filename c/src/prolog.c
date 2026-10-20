@@ -5,5 +5,6 @@
 #include "p3_lex.c"
 #include "p4_db.c"
 #include "p5_solve.c"
+#include "p5_gc.c"
 #include "p6_bi.c"
 #include "p7_main.c"

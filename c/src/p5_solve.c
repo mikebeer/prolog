@@ -190,7 +190,7 @@ typedef struct FAcc {
   Arena ar;
   Term **res;
   long n, cap;
-  Term **omap, **nmap;      /* heap variable -> findall copy */
+  Term **nmap;              /* copies of the variables made inside the findall goal */
   long nmapn, nmapcap;
 } FAcc;
 
@@ -220,6 +220,203 @@ static FAcc *g_fa;
 static Term *g_fatmpl;
 static long g_fapos;
 
+/* ---- elided frames ---------------------------------------------------------
+   A user call that has entered its last candidate clause is no choice point any
+   more, but its frame used to stay on the stack until the call failed or the whole
+   query succeeded, so a deterministic recursion of N steps kept N frames.  Such a
+   frame is now taken off the stack at once and replaced by a small record of what
+   failing back through it would still do:
+     - clear g_cutsig when the cut signal is for this call (or, after an eager cut
+       of the call, always: that is the F_CUT frame plus the call frame);
+     - advance the renaming counter g_rvc by the clauses that would still have
+       been tried (and failed) or that an indexed call skipped;
+     - undo the trail and release the heap to the frame's marks.
+   The records between frame k-1 and frame k form the group of depth k (records of
+   one run only, from g_tbase on).  A record whose body has been completely entered
+   (the current continuation is its continuation) can no longer be the target of a
+   cut, so it is dropped and its remaining effect is folded into the record below:
+   (A, B, C) means "g_rvc += A if g_cutsig == 0, else g_rvc += B; then clear
+   g_cutsig if C".  The lowest record of a group keeps its marks and becomes the
+   group's base record (b = 0).  A tail-recursive loop keeps two records in all.
+   A cut whose target lies below only plain call frames and records (no other cut,
+   disjunction, if-then-else, negation or findall) is done at once: those frames
+   and records are dropped and the target becomes a record with c = 1, which is
+   what failing back into the F_CUT frame of the original engine would have done.
+   Otherwise the F_CUT frame is pushed as before.  Answers, the order of side
+   effects and the renaming counters (variable names) are exactly as before; the
+   collector needs the bounded stack. */
+typedef struct {
+  long depth;              /* sits between g_stk[depth - 1] and g_stk[depth] */
+  long b;                  /* barrier (call number) of the elided call; 0 = base record */
+  long d;                  /* g_rvc advance when the call is exhausted (indexed call) */
+  int c;                   /* the call was cut: failing through it clears g_cutsig */
+  long acca, accb;         /* folded effect of dropped records above this one */
+  int accc;
+  Goal *rest;              /* the call's continuation */
+  long tmark;              /* the frame's marks */
+  AMark hmark;
+} Tomb;
+
+static Term **g_fr;             /* try_clause's variable frame */
+static int g_frcap;
+
+static Tomb *g_tomb;
+static long g_tombn, g_tombcap, g_tbase;
+static int g_elide = 1;
+static unsigned long g_nelided;
+
+/* ---- garbage collector controls (the collector itself is in p5_gc.c) ---- */
+#ifndef GC_MIN
+#define GC_MIN 4194304L
+#endif
+static int g_gc_on = 1, g_gc_req;
+static long g_gc_stress, g_gc_tick;
+static long g_gc_next = GC_MIN, g_gc_znext = GC_MIN;
+static void gc_collect(Goal **gp);
+
+#define HEAP_TOP() (g_heap.n ? g_heap.b[g_heap.cur].base + (long)g_heap.b[g_heap.cur].used : 0L)
+#define GC_DUE() (g_gc_req || (g_gc_on && (g_gc_stress > 0 ? ++g_gc_tick >= g_gc_stress : \
+                  (HEAP_TOP() > g_gc_next || g_zbytes > (unsigned long)g_gc_znext))))
+/* drop the records whose body is complete (tomb_drop), cheap test first */
+#define TOMB_DROP(cont) do { if (g_tombn > g_tbase + 1 && g_tomb[g_tombn - 1].rest == (cont)) \
+                               tomb_drop(cont); } while (0)
+
+/* C variables of the callers of run() that hold heap data while a collection can run */
+enum { GR_TERM, GR_GOAL, GR_AMARK, GR_TMARK };
+typedef struct { int kind; void *p; } GRoot;
+static GRoot *g_roots;
+static int g_nroots, g_rootcap;
+
+static void groot(int kind, void *p)
+{
+  if (g_nroots >= g_rootcap) {
+    g_rootcap = g_rootcap ? g_rootcap * 2 : 16;
+    g_roots = (GRoot *)xrealloc(g_roots, sizeof(GRoot) * (size_t)g_rootcap);
+  }
+  g_roots[g_nroots].kind = kind;
+  g_roots[g_nroots].p = p;
+  g_nroots++;
+}
+
+static void tomb_push(long depth, long b, long d, int c, Goal *rest)
+{
+  Tomb *t;
+  if (g_tombn >= g_tombcap) {
+    g_tombcap = g_tombcap ? g_tombcap * 2 : 256;
+    g_tomb = (Tomb *)xrealloc(g_tomb, sizeof(Tomb) * (size_t)g_tombcap);
+  }
+  t = &g_tomb[g_tombn++];
+  t->depth = depth;
+  t->b = b;
+  t->d = d;
+  t->c = c;
+  t->acca = t->accb = 0;
+  t->accc = 0;
+  t->rest = rest;
+  t->tmark = 0;
+  t->hmark.blk = 0;
+  t->hmark.off = 0;
+}
+
+/* take the top frame (a call in its last clause, or a cut one) off the stack; dskip:
+   renaming numbers the remaining clauses would use up when tried (see run) */
+static void elide_top(int cut, long dskip)
+{
+  Frame *fp = &g_stk[g_sp - 1];
+  long d = dskip;
+  if (!cut && fp->ipos != NULL) d = fp->pre[fp->norig] - fp->pre[fp->last + 1];
+  g_sp--;
+  tomb_push(g_sp, fp->barrier, d, cut, fp->rest);
+  g_tomb[g_tombn - 1].tmark = fp->tmark;
+  g_tomb[g_tombn - 1].hmark = fp->hmark;
+  g_nelided++;
+}
+
+/* drop the records whose body has been entered completely (continuation == cont) */
+static void tomb_drop(Goal *cont)
+{
+  while (g_tombn > g_tbase) {
+    Tomb *t = &g_tomb[g_tombn - 1], *u = t - 1;
+    long ea, eb;
+    int ec, bottom = g_tombn - 1 == g_tbase || u->depth != t->depth;
+    if (t->b == 0 || t->rest != cont || t->depth != g_sp || g_cutsig == t->b) return;
+    if (!bottom && !t->c && !t->d && !t->accc && !t->acca && !t->accb) {   /* no effect */
+      g_tombn--;
+      continue;
+    }
+    /* E = acc(t) followed by t itself (g_cutsig can no longer name t) */
+    ea = t->acca + (t->c ? 0 : t->d);
+    eb = t->accb + (t->accc ? (t->c ? 0 : t->d) : 0);
+    ec = t->accc || t->c;
+    if (bottom) {            /* becomes the group's base record: marks and E only */
+      t->b = 0;
+      t->c = 0;
+      t->d = 0;
+      t->rest = NULL;
+      t->acca = ea;
+      t->accb = eb;
+      t->accc = ec;
+      return;
+    }
+    /* u.acc = E followed by u.acc */
+    eb = eb + (ec ? u->acca : u->accb);
+    u->acca = ea + u->acca;
+    u->accb = eb;
+    u->accc = ec || u->accc;
+    g_tombn--;
+  }
+}
+
+/* failing (v = 0) or succeeding (v = 1) through the group above the top frame */
+static void tomb_unwind(int v)
+{
+  while (g_tombn > g_tbase && g_tomb[g_tombn - 1].depth == g_sp) {
+    Tomb *t = &g_tomb[--g_tombn];
+    if (v) continue;
+    if (g_cutsig == 0) g_rvc += t->acca;
+    else g_rvc += t->accb;
+    if (t->accc) g_cutsig = 0;
+    if (t->b == 0) {
+      ;
+    } else if (t->c || g_cutsig == t->b) {
+      g_cutsig = 0;
+    } else if (g_cutsig == 0) {
+      g_rvc += t->d;
+    }
+    trail_undo(t->tmark);
+    arelease(&g_heap, t->hmark);
+  }
+}
+
+/* the cut of call b (see above); 0 when an F_CUT frame has to be pushed instead */
+static int cut_now(long b, long base)
+{
+  long k = g_sp - 1, ti = g_tombn - 1;
+  for (;;) {
+    while (ti >= g_tbase && g_tomb[ti].depth == k + 1) {
+      Tomb *t = &g_tomb[ti];
+      if (t->b == b && !t->accc) {
+        g_tombn = ti + 1;
+        g_sp = k + 1;
+        t->c = 1;
+        t->d = 0;
+        t->acca = t->accb = 0;
+        return 1;
+      }
+      if (t->c || t->accc) return 0;
+      ti--;
+    }
+    if (k < base || g_stk[k].kind != F_USER) return 0;
+    if (g_stk[k].barrier == b) {
+      g_tombn = ti + 1;
+      g_sp = k + 1;
+      elide_top(1, 0);
+      return 1;
+    }
+    k--;
+  }
+}
+
 static int bi_exec(int id, Term *goal);
 static int bi_sort_list(Term *goal, int dedupe);
 #ifndef NSORT_MIN
@@ -242,10 +439,35 @@ static int on_solution(void);
 
 static Goal *new_goal(Term *t, Goal *next)
 {
-  Goal *g = (Goal *)aalloc(&g_heap, sizeof(Goal));
+  Goal *g = (Goal *)aalloc_k(&g_heap, sizeof(Goal), HK_GOAL);
   g->t = t;
   g->next = next;
   return g;
+}
+
+/* can a clause whose first head argument is the template t match the first argument a
+   (dereferenced, not a variable)?  The same test unify_head does first. */
+static int may_match0(Term *t, Term *a)
+{
+  if (t->tag == T_TV) return 1;
+  if (t->tag == T_CMP || a->tag == T_CMP)
+    return t->tag == T_CMP && a->tag == T_CMP && t->u.c.fn == a->u.c.fn && t->u.c.ar == a->u.c.ar;
+  if (t == a) return 1;
+  return t->tag == T_NUM && a->tag == T_NUM && num_eq(t, a);
+}
+
+/* 0 when head unification of clause c with the goal certainly fails: an argument
+   bound in the goal has another principal functor than the clause head's */
+static int may_match(Clause *c, Term *goal)
+{
+  int k;
+  Term *a;
+  for (k = 0; k < goal->u.c.ar; k++) {
+    if (c->head->u.c.args[k]->tag == T_TV) continue;   /* (no dereferencing for nothing) */
+    a = deref(goal->u.c.args[k]);
+    if (a->tag != T_VAR && !may_match0(c->head->u.c.args[k], a)) return 0;
+  }
+  return 1;
 }
 
 static Frame *push_frame(int kind)
@@ -257,6 +479,12 @@ static Frame *push_frame(int kind)
   }
   f = &g_stk[g_sp++];
   f->kind = kind;
+  f->rest = NULL;
+  f->a = f->b = NULL;
+  f->v = NULL;
+  f->ipos = NULL;
+  f->fa = f->savedfa = NULL;
+  f->tmpl = f->savedtmpl = NULL;
   f->tmark = trail_mark();
   f->hmark = amark(&g_heap);
   f->savedmode = g_mode;
@@ -282,8 +510,16 @@ static Term *fa_out(FAcc *fa, Term *t)
       long i;
       Term *c;
       if (t->u.v.born < g_fapos) { *hole = t; return first; }
-      for (i = 0; i < fa->nmapn; i++)
-        if (fa->omap[i] == t) { *hole = fa->nmap[i]; return first; }
+      /* known by its name, as in the CREXX version where a term is its text (a
+         variable of an earlier answer may have lived at the same address) */
+      for (i = 0; i < fa->nmapn; i++) {
+        c = fa->nmap[i];
+        if (c->u.v.ctr == t->u.v.ctr && c->u.v.sep == t->u.v.sep &&
+            strcmp(c->u.v.base, t->u.v.base) == 0) {
+          *hole = c;
+          return first;
+        }
+      }
       c = (Term *)aalloc(&fa->ar, sizeof(Term));
       c->tag = T_VAR;
       c->gnd = 0;
@@ -294,10 +530,8 @@ static Term *fa_out(FAcc *fa, Term *t)
       c->u.v.born = -1;
       if (fa->nmapn >= fa->nmapcap) {
         fa->nmapcap = fa->nmapcap ? fa->nmapcap * 2 : 16;
-        fa->omap = (Term **)xrealloc(fa->omap, sizeof(Term *) * (size_t)fa->nmapcap);
         fa->nmap = (Term **)xrealloc(fa->nmap, sizeof(Term *) * (size_t)fa->nmapcap);
       }
-      fa->omap[fa->nmapn] = t;
       fa->nmap[fa->nmapn] = c;
       fa->nmapn++;
       *hole = c;
@@ -383,15 +617,15 @@ static void fa_free(FAcc *fa)
 {
   arena_free(&fa->ar);
   free(fa->res);
-  free(fa->omap);
   free(fa->nmap);
   free(fa);
 }
 
 static int run(Goal *goals)
 {
-  long base = g_sp;
-  int v = 0, ar, ar2, i, k, ok;
+  long base = g_sp, otbase = g_tbase;
+  int v = 0, ar, ar2, i, k, ok, lastcl;
+  long dskip;
   Term *goal, *g0, *left, **fr;
   Goal *rest;
   Sym *fn;
@@ -400,7 +634,12 @@ static int run(Goal *goals)
   Pred *pr;
   long cbase;
 
+  g_tbase = g_tombn;
 eval:
+  /* the safe point: everything live is reachable from goals, the frames, the
+     elided-frame records and the registered roots */
+  TOMB_DROP(goals);
+  if (GC_DUE()) gc_collect(&goals);
   if (goals == NULL) {
     v = on_solution();
     goto ret;
@@ -413,8 +652,10 @@ eval:
     goto ret;
   }
   if (goal->tag == T_CUT) {
-    fp = push_frame(F_CUT);
-    fp->barrier = goal->u.x.idx;
+    if (!g_elide || !cut_now(goal->u.x.idx, base)) {
+      fp = push_frame(F_CUT);
+      fp->barrier = goal->u.x.idx;
+    }
     goals = rest;
     goto eval;
   }
@@ -491,7 +732,10 @@ eval:
       goals = new_goal(goal->u.c.args[1], NULL);
       goto eval;
     }
-    if (bi_exec(fn->bi[ar], goal)) goals = rest;
+    groot(GR_GOAL, &rest);      /* consult/1 runs directives: a collection can happen */
+    ok = bi_exec(fn->bi[ar], goal);
+    g_nroots--;
+    if (ok) goals = rest;
     else { v = 0; goto ret; }
     goto eval;
   }
@@ -520,6 +764,7 @@ eval:
     v = 0;
     goto ret;
   }
+  TOMB_DROP(rest);
   fp = push_frame(F_USER);
   fp->a = goal;
   fp->rest = rest;
@@ -556,7 +801,27 @@ try_clause:
     g_rvc += fp->pre[fp->ipos[fp->i]] - fp->pre[fp->last + 1];
     fp->last = fp->ipos[fp->i];
   }
-  fr = (Term **)aalloc(&g_heap, sizeof(Term *) * (size_t)(cl->nvars + 1));
+  /* no alternative after this clause: it is the last one, or the remaining ones (a few,
+     not indexed) cannot match the goal's arguments -- trying them would only use up
+     their renaming numbers, dskip */
+  lastcl = 0;
+  dskip = 0;
+  if (g_elide) {
+    if (fp->i == fp->n - 1) lastcl = 1;
+    else if (fp->ipos == NULL && fp->n - fp->i <= 8 && fp->a->tag == T_CMP && fp->a->u.c.ar > 0) {
+      for (k = fp->i + 1; k < fp->n; k++) {
+        if (may_match(fp->v[k], fp->a)) break;
+        dskip += fp->v[k]->nhead;
+      }
+      lastcl = k == fp->n;
+    }
+  }
+  /* the clause's variables: only needed while the head and body are instantiated */
+  if (cl->nvars + 1 > g_frcap) {
+    g_frcap = cl->nvars + 64;
+    g_fr = (Term **)xrealloc(g_fr, sizeof(Term *) * (size_t)g_frcap);
+  }
+  fr = g_fr;
   for (k = 0; k < cl->nvars; k++) fr[k] = NULL;
   cbase = g_rvc;
   g_rvc += cl->nhead;
@@ -568,6 +833,7 @@ try_clause:
     for (k = cl->nbody - 1; k >= 0; k--)
       g = new_goal(inst_goal(cl->body[k], fr, cl, cbase, barrier), g);
     goals = g;
+    if (lastcl) elide_top(0, dskip);
     goto eval;
   }
   trail_undo(fp->tmark);
@@ -582,7 +848,11 @@ try_clause:
   goto try_clause;
 
 ret:
-  if (g_sp == base) return v;
+  if (g_tombn > g_tbase && g_tomb[g_tombn - 1].depth == g_sp) tomb_unwind(v);
+  if (g_sp == base) {
+    g_tbase = otbase;
+    return v;
+  }
   fp = &g_stk[g_sp - 1];
   switch (fp->kind) {
   case F_CUT: {

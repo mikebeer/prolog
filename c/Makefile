@@ -7,7 +7,7 @@ PYTHON ?= python3
 DECKCOLS ?= 71
 
 SRC = src/prolog.c src/p0_base.c src/p1_num.c src/p2_term.c src/p3_lex.c src/p4_db.c \
-      src/p5_solve.c src/p6_bi.c src/p7_main.c
+      src/p5_solve.c src/p5_gc.c src/p6_bi.c src/p7_main.c
 
 prolog: prolog_all.c
 	$(CC) $(STD) $(CFLAGS) $(POSIX) -o prolog prolog_all.c -lm
@@ -40,6 +40,10 @@ linecheck:
 test: prolog
 	sh tests/run_tests.sh ./prolog
 
+# the whole suite with a garbage collection at every inference (README.md, "Memory")
+gcstress: prolog
+	PROLOG_GC=stress=1 sh tests/run_tests.sh ./prolog
+
 # build the deck with strict flags and run the whole suite against it
 deck-test: deck
 	$(CC) $(STD) -pedantic-errors $(CFLAGS) $(POSIX) -o prolog_deck deck/prolog_deck.c -lm
@@ -55,4 +59,4 @@ bench: prolog
 clean:
 	rm -f prolog prolog_deck strict_san
 
-.PHONY: deck vm370check deckcheck linecheck test deck-test strict bench clean
+.PHONY: deck vm370check deckcheck linecheck test gcstress deck-test strict bench clean

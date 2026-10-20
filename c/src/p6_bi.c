@@ -9,7 +9,7 @@ enum {
   BI_CHAR_CODE, BI_ATOM_CONCAT, BI_UPCASE, BI_DOWNCASE, BI_ASSERT, BI_ASSERTA,
   BI_ASSERTZ, BI_RETRACT, BI_RETRACTALL, BI_WRITE, BI_WRITELN, BI_NL, BI_PRINT,
   BI_TAB, BI_CONSULT, BI_LISTING0, BI_LISTINGALL, BI_LISTING1, BI_SAVE, BI_SAVEALL,
-  BI_LOAD, BI_CXCALL2, BI_CXCALL3, BI_HALT0, BI_HALT1
+  BI_LOAD, BI_CXCALL2, BI_CXCALL3, BI_HALT0, BI_HALT1, BI_GC0, BI_GC1, BI_STATS
 };
 
 static void reg_bi(const char *name, int ar, int id)
@@ -81,6 +81,9 @@ static void init_builtins(void)
   reg_bi("crexx_call", 3, BI_CXCALL3);
   reg_bi("halt", 0, BI_HALT0);
   reg_bi("halt", 1, BI_HALT1);
+  reg_bi("garbage_collect", 0, BI_GC0);
+  reg_bi("gc", 1, BI_GC1);
+  reg_bi("statistics", 0, BI_STATS);
 }
 
 static int is_builtin(Sym *fn, int ar)
@@ -217,7 +220,12 @@ static void consult_string(const char *text)
     if (t == NULL) break;
     if (t->tag == T_CMP && t->u.c.fn == S_NECK && t->u.c.ar == 1) {
       long mark = trail_mark();
-      int ok = solve_once(t->u.c.args[0]);
+      int ok;
+      groot(GR_AMARK, &hm);
+      groot(GR_TERM, &t);
+      groot(GR_TMARK, &mark);
+      ok = solve_once(t->u.c.args[0]);
+      g_nroots -= 3;
       if (!ok) {
         charout("prolog: directive failed: ");
         say(write_term(t, 1));
@@ -716,6 +724,25 @@ static int bi_exec(int id, Term *goal)
     fflush(stdout);
     exit((int)a.d);
   }
+  case BI_GC0:                  /* collected at the next safe point, right after this goal */
+    g_gc_req = 1;
+    return 1;
+  case BI_GC1:                  /* gc(on), gc(off), gc(N): stress mode, every N inferences */
+    v = deref(A[0]);
+    if (v->tag == T_NUM) {
+      g_gc_stress = (long)num_val(v->u.n.txt);
+      g_gc_on = 1;
+      return 1;
+    }
+    if (v->tag != T_ATOM && v->tag != T_QATOM) return 0;
+    if (strcmp(v->u.a.sym->text, "on") == 0) g_gc_on = 1;
+    else if (strcmp(v->u.a.sym->text, "off") == 0) g_gc_on = 0;
+    else return 0;
+    g_gc_stress = 0;
+    return 1;
+  case BI_STATS:
+    gc_stats();
+    return 1;
   default: break;
   }
   say("prolog: internal error -- unimplemented builtin");

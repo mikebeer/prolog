@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #ifdef PL_POSIX
 #include <dirent.h>
 #endif
@@ -49,6 +50,9 @@ struct Clause {
   int nbody;
   int nvars, nhead;
   char **vn;
+  char *mem;               /* one block: this struct, the templates, body and names */
+  size_t msz;
+  int zmark;               /* retracted clause still in use (garbage collector) */
 };
 
 struct Pred {
@@ -67,10 +71,18 @@ typedef struct { char *s; size_t n, cap; } Buf;
 
 /* arena with mark / release */
 typedef struct { char *p; size_t cap, used; long base; } Blk;
-typedef struct { Blk *b; int n, ncap, cur; } Arena;
+typedef struct { Blk *b; int n, ncap, cur; int hdr; } Arena;
 typedef struct { int blk; size_t off; } AMark;
 
-static Arena g_heap, g_perm;
+/* Every object of the heap (hdr = 1) starts with a header word: its size in bytes
+   (header included, a multiple of 8), the kind (bits 0-1) and the collector's mark
+   (bit 2).  The garbage collector (p5_gc.c) walks the heap with it. */
+#define HDRSZ 8
+enum { HK_RAW, HK_TERM, HK_GOAL };
+#define HK_KIND 3UL
+#define HK_MARK 4UL
+
+static Arena g_heap = { NULL, 0, 0, 0, 1 }, g_perm;
 static Sym *g_symtab[NSYMH];
 
 static void die(const char *msg)
@@ -103,11 +115,13 @@ static char *xstrdup(const char *s)
 }
 
 /* ---- arena ---- */
-static void *aalloc(Arena *a, size_t n)
+static void *aalloc_k(Arena *a, size_t n, int kind)
 {
   Blk *b;
-  void *r;
+  char *r;
+  if (a->hdr && n < sizeof(void *)) n = sizeof(void *);   /* room for a forwarding pointer */
   n = (n + 7) & ~(size_t)7;
+  if (a->hdr) n += HDRSZ;
   if (a->n == 0) {
     a->ncap = 8;
     a->b = (Blk *)xmalloc(sizeof(Blk) * (size_t)a->ncap);
@@ -140,8 +154,14 @@ static void *aalloc(Arena *a, size_t n)
   b = &a->b[a->cur];
   r = b->p + b->used;
   b->used += n;
+  if (a->hdr) {
+    *(unsigned long *)r = (unsigned long)n | (unsigned long)kind;
+    r += HDRSZ;
+  }
   return r;
 }
+
+static void *aalloc(Arena *a, size_t n) { return aalloc_k(a, n, HK_RAW); }
 
 static long apos(Arena *a)
 {
@@ -588,7 +608,7 @@ static Term *mk_atom_s(const char *s) { return mk_atom(intern(s)); }
 static Term *mk_var(const char *base, int sep, long ctr)
 {
   long b = apos(&g_heap);
-  Term *t = (Term *)aalloc(&g_heap, sizeof(Term));
+  Term *t = (Term *)aalloc_k(&g_heap, sizeof(Term), HK_TERM);
   t->tag = T_VAR;
   t->gnd = 0;
   t->u.v.ref = NULL;
@@ -601,7 +621,7 @@ static Term *mk_var(const char *base, int sep, long ctr)
 
 static Term *mk_numa(Arena *a, const char *txt)
 {
-  Term *t = (Term *)aalloc(a, sizeof(Term));
+  Term *t = (Term *)aalloc_k(a, sizeof(Term), HK_TERM);
   t->tag = T_NUM;
   t->gnd = 1;
   t->u.n.txt = astrdup(a, txt);
@@ -619,7 +639,7 @@ static Term *mk_long(long v)
 
 static Term *mk_cmpa(Arena *a, Sym *fn, int ar)
 {
-  Term *t = (Term *)aalloc(a, sizeof(Term) + sizeof(Term *) * (size_t)(ar ? ar : 1));
+  Term *t = (Term *)aalloc_k(a, sizeof(Term) + sizeof(Term *) * (size_t)(ar ? ar : 1), HK_TERM);
   int i;
   t->tag = T_CMP;
   t->gnd = 0;
@@ -1695,6 +1715,60 @@ struct PIdx {
   int bad;                 /* too many variable-first-argument clauses: do not use */
 };
 
+/* ---- storage no longer reachable from the database --------------------------
+   Retracted clauses, clause arrays replaced by assert / retract and the arrays of
+   dropped first-argument indexes can still be in use: a running call holds the
+   array and walks its clauses, and terms made from a clause share its ground
+   sub-terms, numbers and variable names.  They wait on these lists and the garbage
+   collector (p5_gc.c) frees them once nothing refers to them any more. */
+typedef struct { void *p; size_t sz; int mark; } ZArr;
+static Clause **g_zcl;
+static long g_zcln, g_zclcap;
+static ZArr *g_zar;
+static long g_zarn, g_zarcap;
+static unsigned long g_zbytes;      /* bytes waiting on the two lists */
+
+static void zombie_arr(void *p, size_t sz)
+{
+  if (p == NULL) return;
+  if (g_zarn >= g_zarcap) {
+    g_zarcap = g_zarcap ? g_zarcap * 2 : 64;
+    g_zar = (ZArr *)xrealloc(g_zar, sizeof(ZArr) * (size_t)g_zarcap);
+  }
+  g_zar[g_zarn].p = p;
+  g_zar[g_zarn].sz = sz;
+  g_zar[g_zarn].mark = 0;
+  g_zarn++;
+  g_zbytes += (unsigned long)sz;
+}
+
+static void zombie_clause(Clause *c)
+{
+  if (g_zcln >= g_zclcap) {
+    g_zclcap = g_zclcap ? g_zclcap * 2 : 64;
+    g_zcl = (Clause **)xrealloc(g_zcl, sizeof(Clause *) * (size_t)g_zclcap);
+  }
+  c->zmark = 0;
+  g_zcl[g_zcln++] = c;
+  g_zbytes += (unsigned long)c->msz;
+}
+
+static void zombie_idx(PIdx *x)
+{
+  int i;
+  if (x == NULL) return;
+  zombie_arr(x->pre, sizeof(long) * (size_t)x->precap);
+  zombie_arr(x->wild.c, sizeof(Clause *) * (size_t)x->wild.cap);
+  zombie_arr(x->wild.pos, sizeof(int) * (size_t)x->wild.cap);
+  for (i = 0; i < x->tcap; i++) {
+    if (!x->tab[i].kind) continue;
+    zombie_arr(x->tab[i].b.c, sizeof(Clause *) * (size_t)x->tab[i].b.cap);
+    zombie_arr(x->tab[i].b.pos, sizeof(int) * (size_t)x->tab[i].b.cap);
+  }
+  free(x->tab);            /* running calls hold bucket arrays, never the table */
+  free(x);
+}
+
 /* key of a (dereferenced, non-variable) first argument; 0 = no key */
 static int idx_key(Term *t, const void **p, double *d, int *ar)
 {
@@ -1745,6 +1819,8 @@ static void ibkt_add(IBkt *b, Clause *c, int pos)
       memcpy(nc, b->c, sizeof(Clause *) * (size_t)b->n);
       memcpy(np, b->pos, sizeof(int) * (size_t)b->n);
     }
+    zombie_arr(b->c, sizeof(Clause *) * (size_t)b->cap);
+    zombie_arr(b->pos, sizeof(int) * (size_t)b->cap);
     b->c = nc;
     b->pos = np;
     b->cap = ncap;
@@ -1810,6 +1886,7 @@ static int idx_append(PIdx *x, Clause *c, int pos)
     int ncap = x->precap ? x->precap * 2 : 16;
     long *np = (long *)xmalloc(sizeof(long) * (size_t)ncap);
     if (x->precap) memcpy(np, x->pre, sizeof(long) * (size_t)x->precap);
+    zombie_arr(x->pre, sizeof(long) * (size_t)x->precap);
     x->pre = np;
     x->precap = ncap;
   }
@@ -1864,6 +1941,7 @@ static PIdx *idx_for_call(Pred *p, Term *a, IBkt **bk)
   if (kind == 0) return NULL;
   x = p->idx;
   if (x == NULL || x->v != p->v || x->n != p->n) {
+    zombie_idx(x);
     x = idx_build(p);
     p->idx = x;
   }
@@ -1881,7 +1959,10 @@ static void pred_add(Pred *p, Clause *c, int atz)
 {
   int keep = atz && p->idx != NULL && !p->idx->bad && p->idx->v == p->v && p->idx->n == p->n;
   pred_note_listed(p);
-  if (!keep) p->idx = NULL;
+  if (!keep) {
+    zombie_idx(p->idx);
+    p->idx = NULL;
+  }
   if (atz) {
     if (p->n < p->cap) {
       p->v[p->n++] = c;
@@ -1891,6 +1972,7 @@ static void pred_add(Pred *p, Clause *c, int atz)
       nv = (Clause **)xmalloc(sizeof(Clause *) * (size_t)ncap);
       if (p->n) memcpy(nv, p->v, sizeof(Clause *) * (size_t)p->n);
       nv[p->n++] = c;
+      zombie_arr(p->v, sizeof(Clause *) * (size_t)p->cap);
       p->v = nv;
       p->cap = ncap;
     }
@@ -1898,13 +1980,17 @@ static void pred_add(Pred *p, Clause *c, int atz)
     Clause **nv = (Clause **)xmalloc(sizeof(Clause *) * (size_t)(p->n + 4));
     if (p->n) memcpy(nv + 1, p->v, sizeof(Clause *) * (size_t)p->n);
     nv[0] = c;
+    zombie_arr(p->v, sizeof(Clause *) * (size_t)p->cap);
     p->v = nv;
     p->n++;
     p->cap = p->n + 3;
   }
   if (keep) {
     p->idx->v = p->v;
-    if (!idx_append(p->idx, c, p->n - 1)) p->idx = NULL;
+    if (!idx_append(p->idx, c, p->n - 1)) {
+      zombie_idx(p->idx);
+      p->idx = NULL;
+    }
   }
 }
 
@@ -1912,6 +1998,8 @@ static void pred_set(Pred *p, Clause **keep, int n)
 {
   Clause **nv = (Clause **)xmalloc(sizeof(Clause *) * (size_t)(n + 4));
   if (n) memcpy(nv, keep, sizeof(Clause *) * (size_t)n);
+  zombie_arr(p->v, sizeof(Clause *) * (size_t)p->cap);
+  zombie_idx(p->idx);
   p->v = nv;
   p->n = n;
   p->cap = n + 4;
@@ -1941,23 +2029,49 @@ static int is_gnd(Term *t)
   return t->tag == T_ATOM || t->tag == T_QATOM || t->tag == T_NUM;
 }
 
-static Term *tmpl_build(Term *t, VList *vl)
+#define RND8(n) (((size_t)(n) + 7) & ~(size_t)7)
+
+/* the bytes tmpl_build will take (aalloc rounds every piece to 8) */
+static size_t tmpl_size(Term *t, VList *vl)
+{
+  size_t sz = 0;
+  int i, n;
+  for (;;) {
+    t = deref(t);
+    switch (t->tag) {
+    case T_VAR:
+      vl_index(vl, t);
+      return sz + RND8(sizeof(Term));
+    case T_NUM: return sz + RND8(sizeof(Term)) + RND8(strlen(t->u.n.txt) + 1);
+    case T_CMP:
+      n = t->u.c.ar;
+      sz += RND8(sizeof(Term) + sizeof(Term *) * (size_t)(n ? n : 1));
+      if (n == 0) return sz;
+      for (i = 0; i < n - 1; i++) sz += tmpl_size(t->u.c.args[i], vl);
+      t = t->u.c.args[n - 1];
+      break;
+    default: return sz;
+    }
+  }
+}
+
+static Term *tmpl_build(Arena *ca, Term *t, VList *vl)
 {
   t = deref(t);
   switch (t->tag) {
   case T_VAR: {
-    Term *x = (Term *)aalloc(&g_perm, sizeof(Term));
+    Term *x = (Term *)aalloc(ca, sizeof(Term));
     x->tag = T_TV;
     x->gnd = 0;
     x->u.x.idx = vl_index(vl, t);
     return x;
   }
-  case T_NUM: return mk_numa(&g_perm, t->u.n.txt);
+  case T_NUM: return mk_numa(ca, t->u.n.txt);
   case T_CMP: {
     int i, n = t->u.c.ar, g = 1;
-    Term *r = mk_cmpa(&g_perm, t->u.c.fn, n);
+    Term *r = mk_cmpa(ca, t->u.c.fn, n);
     for (i = 0; i < n; i++) {
-      r->u.c.args[i] = tmpl_build(t->u.c.args[i], vl);
+      r->u.c.args[i] = tmpl_build(ca, t->u.c.args[i], vl);
       if (!is_gnd(r->u.c.args[i])) g = 0;
     }
     r->gnd = g;
@@ -1990,6 +2104,8 @@ static void assert_clause(Term *term, int atz)
   Sym *fn;
   Pred *p;
   Buf nb;
+  Arena ca;
+  size_t sz;
   if (term->tag == T_CMP && term->u.c.fn == S_NECK && term->u.c.ar == 2) {
     head = term->u.c.args[0];
     flatten_conj(term->u.c.args[1], &goals, &ng, &gcap);
@@ -1997,22 +2113,46 @@ static void assert_clause(Term *term, int atz)
   fn = functor_of(head, &ar);
   p = pred_find(fn, ar, 1);
   g_clcount++;
-  c = (Clause *)xmalloc(sizeof(Clause));
-  c->id = g_clcount;
+  /* the clause lives in one block of exactly the size it needs, so that it can be
+     freed after retract (see zombie_clause) */
   vl.v = NULL; vl.n = vl.cap = 0;
-  c->head = tmpl_build(head, &vl);
-  c->nhead = vl.n;
-  c->nbody = ng;
-  c->body = (Term **)aalloc(&g_perm, sizeof(Term *) * (size_t)(ng ? ng : 1));
-  for (i = 0; i < ng; i++) c->body[i] = tmpl_build(goals[i], &vl);
-  c->nvars = vl.n;
-  c->vn = (char **)aalloc(&g_perm, sizeof(char *) * (size_t)(vl.n ? vl.n : 1));
   nb.s = NULL; nb.n = nb.cap = 0;
+  sz = RND8(sizeof(Clause)) + tmpl_size(head, &vl);
+  for (i = 0; i < ng; i++) sz += tmpl_size(goals[i], &vl);
+  sz += RND8(sizeof(Term *) * (size_t)(ng ? ng : 1));
+  sz += RND8(sizeof(char *) * (size_t)(vl.n ? vl.n : 1));
   for (i = 0; i < vl.n; i++) {
     bclear(&nb);
     var_name(vl.v[i], &nb);
-    c->vn[i] = astrdup(&g_perm, bstr(&nb));
+    sz += RND8(nb.n + 1);
   }
+  vl.n = 0;
+  memset(&ca, 0, sizeof ca);
+  ca.ncap = ca.n = 1;
+  ca.b = (Blk *)xmalloc(sizeof(Blk));
+  ca.b[0].p = (char *)xmalloc(sz);
+  ca.b[0].cap = sz;
+  ca.b[0].used = 0;
+  ca.b[0].base = 0;
+  c = (Clause *)aalloc(&ca, sizeof(Clause));
+  c->mem = ca.b[0].p;
+  c->msz = sz;
+  c->zmark = -1;
+  c->id = g_clcount;
+  c->head = tmpl_build(&ca, head, &vl);
+  c->nhead = vl.n;
+  c->nbody = ng;
+  c->body = (Term **)aalloc(&ca, sizeof(Term *) * (size_t)(ng ? ng : 1));
+  for (i = 0; i < ng; i++) c->body[i] = tmpl_build(&ca, goals[i], &vl);
+  c->nvars = vl.n;
+  c->vn = (char **)aalloc(&ca, sizeof(char *) * (size_t)(vl.n ? vl.n : 1));
+  for (i = 0; i < vl.n; i++) {
+    bclear(&nb);
+    var_name(vl.v[i], &nb);
+    c->vn[i] = astrdup(&ca, bstr(&nb));
+  }
+  if (ca.n != 1 || ca.b[0].used != sz) die("internal error: clause size");
+  free(ca.b);
   free(nb.s);
   free(vl.v);
   free(goals);
@@ -2042,7 +2182,7 @@ static Term *inst(Term *t, Term **fr, Clause *c, long cbase)
 static Term *inst_goal(Term *t, Term **fr, Clause *c, long cbase, long barrier)
 {
   if (t->tag == T_ATOM && t->u.a.sym == S_BANG) {
-    Term *x = (Term *)aalloc(&g_heap, sizeof(Term));
+    Term *x = (Term *)aalloc_k(&g_heap, sizeof(Term), HK_TERM);
     x->tag = T_CUT;
     x->gnd = 0;
     x->u.x.idx = barrier;
@@ -2137,6 +2277,7 @@ static int retract_clause(Term *headpat, Term *bodypat)
       for (j = 0; j < n; j++) if (v[j] != c) keep[k++] = v[j];
       pred_set(p, keep, k);
       free(keep);
+      zombie_clause(c);
       return 1;
     }
     trail_undo(tm);
@@ -2164,6 +2305,7 @@ static void retract_all(Term *pat)
     rh = inst(c->head, fr, c, g_rvc);
     g_rvc += c->nhead;
     if (!unify(pat, rh)) keep[k++] = c;
+    else zombie_clause(c);
     trail_undo(tm);
     arelease(&g_heap, hm);
   }
@@ -2468,7 +2610,7 @@ typedef struct FAcc {
   Arena ar;
   Term **res;
   long n, cap;
-  Term **omap, **nmap;      /* heap variable -> findall copy */
+  Term **nmap;              /* copies of the variables made inside the findall goal */
   long nmapn, nmapcap;
 } FAcc;
 
@@ -2498,6 +2640,203 @@ static FAcc *g_fa;
 static Term *g_fatmpl;
 static long g_fapos;
 
+/* ---- elided frames ---------------------------------------------------------
+   A user call that has entered its last candidate clause is no choice point any
+   more, but its frame used to stay on the stack until the call failed or the whole
+   query succeeded, so a deterministic recursion of N steps kept N frames.  Such a
+   frame is now taken off the stack at once and replaced by a small record of what
+   failing back through it would still do:
+     - clear g_cutsig when the cut signal is for this call (or, after an eager cut
+       of the call, always: that is the F_CUT frame plus the call frame);
+     - advance the renaming counter g_rvc by the clauses that would still have
+       been tried (and failed) or that an indexed call skipped;
+     - undo the trail and release the heap to the frame's marks.
+   The records between frame k-1 and frame k form the group of depth k (records of
+   one run only, from g_tbase on).  A record whose body has been completely entered
+   (the current continuation is its continuation) can no longer be the target of a
+   cut, so it is dropped and its remaining effect is folded into the record below:
+   (A, B, C) means "g_rvc += A if g_cutsig == 0, else g_rvc += B; then clear
+   g_cutsig if C".  The lowest record of a group keeps its marks and becomes the
+   group's base record (b = 0).  A tail-recursive loop keeps two records in all.
+   A cut whose target lies below only plain call frames and records (no other cut,
+   disjunction, if-then-else, negation or findall) is done at once: those frames
+   and records are dropped and the target becomes a record with c = 1, which is
+   what failing back into the F_CUT frame of the original engine would have done.
+   Otherwise the F_CUT frame is pushed as before.  Answers, the order of side
+   effects and the renaming counters (variable names) are exactly as before; the
+   collector needs the bounded stack. */
+typedef struct {
+  long depth;              /* sits between g_stk[depth - 1] and g_stk[depth] */
+  long b;                  /* barrier (call number) of the elided call; 0 = base record */
+  long d;                  /* g_rvc advance when the call is exhausted (indexed call) */
+  int c;                   /* the call was cut: failing through it clears g_cutsig */
+  long acca, accb;         /* folded effect of dropped records above this one */
+  int accc;
+  Goal *rest;              /* the call's continuation */
+  long tmark;              /* the frame's marks */
+  AMark hmark;
+} Tomb;
+
+static Term **g_fr;             /* try_clause's variable frame */
+static int g_frcap;
+
+static Tomb *g_tomb;
+static long g_tombn, g_tombcap, g_tbase;
+static int g_elide = 1;
+static unsigned long g_nelided;
+
+/* ---- garbage collector controls (the collector itself is in p5_gc.c) ---- */
+#ifndef GC_MIN
+#define GC_MIN 4194304L
+#endif
+static int g_gc_on = 1, g_gc_req;
+static long g_gc_stress, g_gc_tick;
+static long g_gc_next = GC_MIN, g_gc_znext = GC_MIN;
+static void gc_collect(Goal **gp);
+
+#define HEAP_TOP() (g_heap.n ? g_heap.b[g_heap.cur].base + (long)g_heap.b[g_heap.cur].used : 0L)
+#define GC_DUE() (g_gc_req || (g_gc_on && (g_gc_stress > 0 ? ++g_gc_tick >= g_gc_stress : \
+                  (HEAP_TOP() > g_gc_next || g_zbytes > (unsigned long)g_gc_znext))))
+/* drop the records whose body is complete (tomb_drop), cheap test first */
+#define TOMB_DROP(cont) do { if (g_tombn > g_tbase + 1 && g_tomb[g_tombn - 1].rest == (cont)) \
+                               tomb_drop(cont); } while (0)
+
+/* C variables of the callers of run() that hold heap data while a collection can run */
+enum { GR_TERM, GR_GOAL, GR_AMARK, GR_TMARK };
+typedef struct { int kind; void *p; } GRoot;
+static GRoot *g_roots;
+static int g_nroots, g_rootcap;
+
+static void groot(int kind, void *p)
+{
+  if (g_nroots >= g_rootcap) {
+    g_rootcap = g_rootcap ? g_rootcap * 2 : 16;
+    g_roots = (GRoot *)xrealloc(g_roots, sizeof(GRoot) * (size_t)g_rootcap);
+  }
+  g_roots[g_nroots].kind = kind;
+  g_roots[g_nroots].p = p;
+  g_nroots++;
+}
+
+static void tomb_push(long depth, long b, long d, int c, Goal *rest)
+{
+  Tomb *t;
+  if (g_tombn >= g_tombcap) {
+    g_tombcap = g_tombcap ? g_tombcap * 2 : 256;
+    g_tomb = (Tomb *)xrealloc(g_tomb, sizeof(Tomb) * (size_t)g_tombcap);
+  }
+  t = &g_tomb[g_tombn++];
+  t->depth = depth;
+  t->b = b;
+  t->d = d;
+  t->c = c;
+  t->acca = t->accb = 0;
+  t->accc = 0;
+  t->rest = rest;
+  t->tmark = 0;
+  t->hmark.blk = 0;
+  t->hmark.off = 0;
+}
+
+/* take the top frame (a call in its last clause, or a cut one) off the stack; dskip:
+   renaming numbers the remaining clauses would use up when tried (see run) */
+static void elide_top(int cut, long dskip)
+{
+  Frame *fp = &g_stk[g_sp - 1];
+  long d = dskip;
+  if (!cut && fp->ipos != NULL) d = fp->pre[fp->norig] - fp->pre[fp->last + 1];
+  g_sp--;
+  tomb_push(g_sp, fp->barrier, d, cut, fp->rest);
+  g_tomb[g_tombn - 1].tmark = fp->tmark;
+  g_tomb[g_tombn - 1].hmark = fp->hmark;
+  g_nelided++;
+}
+
+/* drop the records whose body has been entered completely (continuation == cont) */
+static void tomb_drop(Goal *cont)
+{
+  while (g_tombn > g_tbase) {
+    Tomb *t = &g_tomb[g_tombn - 1], *u = t - 1;
+    long ea, eb;
+    int ec, bottom = g_tombn - 1 == g_tbase || u->depth != t->depth;
+    if (t->b == 0 || t->rest != cont || t->depth != g_sp || g_cutsig == t->b) return;
+    if (!bottom && !t->c && !t->d && !t->accc && !t->acca && !t->accb) {   /* no effect */
+      g_tombn--;
+      continue;
+    }
+    /* E = acc(t) followed by t itself (g_cutsig can no longer name t) */
+    ea = t->acca + (t->c ? 0 : t->d);
+    eb = t->accb + (t->accc ? (t->c ? 0 : t->d) : 0);
+    ec = t->accc || t->c;
+    if (bottom) {            /* becomes the group's base record: marks and E only */
+      t->b = 0;
+      t->c = 0;
+      t->d = 0;
+      t->rest = NULL;
+      t->acca = ea;
+      t->accb = eb;
+      t->accc = ec;
+      return;
+    }
+    /* u.acc = E followed by u.acc */
+    eb = eb + (ec ? u->acca : u->accb);
+    u->acca = ea + u->acca;
+    u->accb = eb;
+    u->accc = ec || u->accc;
+    g_tombn--;
+  }
+}
+
+/* failing (v = 0) or succeeding (v = 1) through the group above the top frame */
+static void tomb_unwind(int v)
+{
+  while (g_tombn > g_tbase && g_tomb[g_tombn - 1].depth == g_sp) {
+    Tomb *t = &g_tomb[--g_tombn];
+    if (v) continue;
+    if (g_cutsig == 0) g_rvc += t->acca;
+    else g_rvc += t->accb;
+    if (t->accc) g_cutsig = 0;
+    if (t->b == 0) {
+      ;
+    } else if (t->c || g_cutsig == t->b) {
+      g_cutsig = 0;
+    } else if (g_cutsig == 0) {
+      g_rvc += t->d;
+    }
+    trail_undo(t->tmark);
+    arelease(&g_heap, t->hmark);
+  }
+}
+
+/* the cut of call b (see above); 0 when an F_CUT frame has to be pushed instead */
+static int cut_now(long b, long base)
+{
+  long k = g_sp - 1, ti = g_tombn - 1;
+  for (;;) {
+    while (ti >= g_tbase && g_tomb[ti].depth == k + 1) {
+      Tomb *t = &g_tomb[ti];
+      if (t->b == b && !t->accc) {
+        g_tombn = ti + 1;
+        g_sp = k + 1;
+        t->c = 1;
+        t->d = 0;
+        t->acca = t->accb = 0;
+        return 1;
+      }
+      if (t->c || t->accc) return 0;
+      ti--;
+    }
+    if (k < base || g_stk[k].kind != F_USER) return 0;
+    if (g_stk[k].barrier == b) {
+      g_tombn = ti + 1;
+      g_sp = k + 1;
+      elide_top(1, 0);
+      return 1;
+    }
+    k--;
+  }
+}
+
 static int bi_exec(int id, Term *goal);
 static int bi_sort_list(Term *goal, int dedupe);
 #ifndef NSORT_MIN
@@ -2520,10 +2859,35 @@ static int on_solution(void);
 
 static Goal *new_goal(Term *t, Goal *next)
 {
-  Goal *g = (Goal *)aalloc(&g_heap, sizeof(Goal));
+  Goal *g = (Goal *)aalloc_k(&g_heap, sizeof(Goal), HK_GOAL);
   g->t = t;
   g->next = next;
   return g;
+}
+
+/* can a clause whose first head argument is the template t match the first argument a
+   (dereferenced, not a variable)?  The same test unify_head does first. */
+static int may_match0(Term *t, Term *a)
+{
+  if (t->tag == T_TV) return 1;
+  if (t->tag == T_CMP || a->tag == T_CMP)
+    return t->tag == T_CMP && a->tag == T_CMP && t->u.c.fn == a->u.c.fn && t->u.c.ar == a->u.c.ar;
+  if (t == a) return 1;
+  return t->tag == T_NUM && a->tag == T_NUM && num_eq(t, a);
+}
+
+/* 0 when head unification of clause c with the goal certainly fails: an argument
+   bound in the goal has another principal functor than the clause head's */
+static int may_match(Clause *c, Term *goal)
+{
+  int k;
+  Term *a;
+  for (k = 0; k < goal->u.c.ar; k++) {
+    if (c->head->u.c.args[k]->tag == T_TV) continue;   /* (no dereferencing for nothing) */
+    a = deref(goal->u.c.args[k]);
+    if (a->tag != T_VAR && !may_match0(c->head->u.c.args[k], a)) return 0;
+  }
+  return 1;
 }
 
 static Frame *push_frame(int kind)
@@ -2535,6 +2899,12 @@ static Frame *push_frame(int kind)
   }
   f = &g_stk[g_sp++];
   f->kind = kind;
+  f->rest = NULL;
+  f->a = f->b = NULL;
+  f->v = NULL;
+  f->ipos = NULL;
+  f->fa = f->savedfa = NULL;
+  f->tmpl = f->savedtmpl = NULL;
   f->tmark = trail_mark();
   f->hmark = amark(&g_heap);
   f->savedmode = g_mode;
@@ -2560,8 +2930,16 @@ static Term *fa_out(FAcc *fa, Term *t)
       long i;
       Term *c;
       if (t->u.v.born < g_fapos) { *hole = t; return first; }
-      for (i = 0; i < fa->nmapn; i++)
-        if (fa->omap[i] == t) { *hole = fa->nmap[i]; return first; }
+      /* known by its name, as in the CREXX version where a term is its text (a
+         variable of an earlier answer may have lived at the same address) */
+      for (i = 0; i < fa->nmapn; i++) {
+        c = fa->nmap[i];
+        if (c->u.v.ctr == t->u.v.ctr && c->u.v.sep == t->u.v.sep &&
+            strcmp(c->u.v.base, t->u.v.base) == 0) {
+          *hole = c;
+          return first;
+        }
+      }
       c = (Term *)aalloc(&fa->ar, sizeof(Term));
       c->tag = T_VAR;
       c->gnd = 0;
@@ -2572,10 +2950,8 @@ static Term *fa_out(FAcc *fa, Term *t)
       c->u.v.born = -1;
       if (fa->nmapn >= fa->nmapcap) {
         fa->nmapcap = fa->nmapcap ? fa->nmapcap * 2 : 16;
-        fa->omap = (Term **)xrealloc(fa->omap, sizeof(Term *) * (size_t)fa->nmapcap);
         fa->nmap = (Term **)xrealloc(fa->nmap, sizeof(Term *) * (size_t)fa->nmapcap);
       }
-      fa->omap[fa->nmapn] = t;
       fa->nmap[fa->nmapn] = c;
       fa->nmapn++;
       *hole = c;
@@ -2661,15 +3037,15 @@ static void fa_free(FAcc *fa)
 {
   arena_free(&fa->ar);
   free(fa->res);
-  free(fa->omap);
   free(fa->nmap);
   free(fa);
 }
 
 static int run(Goal *goals)
 {
-  long base = g_sp;
-  int v = 0, ar, ar2, i, k, ok;
+  long base = g_sp, otbase = g_tbase;
+  int v = 0, ar, ar2, i, k, ok, lastcl;
+  long dskip;
   Term *goal, *g0, *left, **fr;
   Goal *rest;
   Sym *fn;
@@ -2678,7 +3054,12 @@ static int run(Goal *goals)
   Pred *pr;
   long cbase;
 
+  g_tbase = g_tombn;
 eval:
+  /* the safe point: everything live is reachable from goals, the frames, the
+     elided-frame records and the registered roots */
+  TOMB_DROP(goals);
+  if (GC_DUE()) gc_collect(&goals);
   if (goals == NULL) {
     v = on_solution();
     goto ret;
@@ -2691,8 +3072,10 @@ eval:
     goto ret;
   }
   if (goal->tag == T_CUT) {
-    fp = push_frame(F_CUT);
-    fp->barrier = goal->u.x.idx;
+    if (!g_elide || !cut_now(goal->u.x.idx, base)) {
+      fp = push_frame(F_CUT);
+      fp->barrier = goal->u.x.idx;
+    }
     goals = rest;
     goto eval;
   }
@@ -2769,7 +3152,10 @@ eval:
       goals = new_goal(goal->u.c.args[1], NULL);
       goto eval;
     }
-    if (bi_exec(fn->bi[ar], goal)) goals = rest;
+    groot(GR_GOAL, &rest);      /* consult/1 runs directives: a collection can happen */
+    ok = bi_exec(fn->bi[ar], goal);
+    g_nroots--;
+    if (ok) goals = rest;
     else { v = 0; goto ret; }
     goto eval;
   }
@@ -2798,6 +3184,7 @@ eval:
     v = 0;
     goto ret;
   }
+  TOMB_DROP(rest);
   fp = push_frame(F_USER);
   fp->a = goal;
   fp->rest = rest;
@@ -2834,7 +3221,27 @@ try_clause:
     g_rvc += fp->pre[fp->ipos[fp->i]] - fp->pre[fp->last + 1];
     fp->last = fp->ipos[fp->i];
   }
-  fr = (Term **)aalloc(&g_heap, sizeof(Term *) * (size_t)(cl->nvars + 1));
+  /* no alternative after this clause: it is the last one, or the remaining ones (a few,
+     not indexed) cannot match the goal's arguments -- trying them would only use up
+     their renaming numbers, dskip */
+  lastcl = 0;
+  dskip = 0;
+  if (g_elide) {
+    if (fp->i == fp->n - 1) lastcl = 1;
+    else if (fp->ipos == NULL && fp->n - fp->i <= 8 && fp->a->tag == T_CMP && fp->a->u.c.ar > 0) {
+      for (k = fp->i + 1; k < fp->n; k++) {
+        if (may_match(fp->v[k], fp->a)) break;
+        dskip += fp->v[k]->nhead;
+      }
+      lastcl = k == fp->n;
+    }
+  }
+  /* the clause's variables: only needed while the head and body are instantiated */
+  if (cl->nvars + 1 > g_frcap) {
+    g_frcap = cl->nvars + 64;
+    g_fr = (Term **)xrealloc(g_fr, sizeof(Term *) * (size_t)g_frcap);
+  }
+  fr = g_fr;
   for (k = 0; k < cl->nvars; k++) fr[k] = NULL;
   cbase = g_rvc;
   g_rvc += cl->nhead;
@@ -2846,6 +3253,7 @@ try_clause:
     for (k = cl->nbody - 1; k >= 0; k--)
       g = new_goal(inst_goal(cl->body[k], fr, cl, cbase, barrier), g);
     goals = g;
+    if (lastcl) elide_top(0, dskip);
     goto eval;
   }
   trail_undo(fp->tmark);
@@ -2860,7 +3268,11 @@ try_clause:
   goto try_clause;
 
 ret:
-  if (g_sp == base) return v;
+  if (g_tombn > g_tbase && g_tomb[g_tombn - 1].depth == g_sp) tomb_unwind(v);
+  if (g_sp == base) {
+    g_tbase = otbase;
+    return v;
+  }
   fp = &g_stk[g_sp - 1];
   switch (fp->kind) {
   case F_CUT: {
@@ -2970,6 +3382,573 @@ static int solve_once(Term *goal)
   g_mode = saved;
   return found;
 }
+/* ===== p5_gc.c ===== */
+/* p5_gc.c - garbage collector: heap, trail, retracted clauses
+
+   The heap is an arena that backtracking releases to marks (AMark in every frame,
+   positions in findall), so the collector keeps the allocation order: it is a
+   mark-and-copy collector that copies the live objects, in address order, into a
+   fresh arena and maps every mark to the position of the first live object at or
+   after it.  Every heap object has a header (p0_base.c) with its size, kind and the
+   mark bit, so the heap can be walked.
+
+   It runs only at the top of the solver loop (run(), label eval), where everything
+   live is reachable from:
+     the current goal list; the frames (continuations, goals, findall results); the
+     elided-frame records; g_fatmpl; the query and clause variable maps; the C
+     variables registered with groot() by the callers of run().
+   The trail is not a root: an entry whose variable is otherwise unreachable is
+   dropped (resetting it could not be observed) and the trail marks are mapped.
+   Retracted clauses and replaced clause arrays (p4_db.c) are freed when no frame
+   can still try them and no live term points into them.
+   Variable names, counters and the order of everything are unchanged; a variable's
+   "born" position becomes its new position (it is only compared with marks). */
+
+static unsigned long g_gc_count, g_gc_clfreed;
+static double g_gc_secs, g_gc_freed;
+static long g_gc_live, g_gc_peak;
+static int g_gc_verbose;
+
+typedef struct { char *lo, *hi; void *owner; } GSpan;
+static GSpan *g_hsp, *g_zsp;            /* heap blocks / retracted clauses, by address */
+static int g_hspn, g_zspn;
+
+/* translated marks: kind 0 = AMark of the heap, 1 = heap position, 2 = trail index */
+typedef struct { int kind; void *p; long pos; } GMark;
+static GMark *g_gm;
+static long g_gmn, g_gmcap;
+
+static void **g_mst;                    /* mark stack */
+static long g_msn, g_mscap;
+
+static long *g_cpm;                     /* trail marks of the choice points, sorted */
+static long g_cpmn, g_cpmcap;
+static unsigned long g_gc_shunted;
+
+static int gspan_cmp(const void *x, const void *y)
+{
+  const GSpan *a = (const GSpan *)x, *b = (const GSpan *)y;
+  if (a->lo < b->lo) return -1;
+  return a->lo > b->lo ? 1 : 0;
+}
+
+static int span_find(GSpan *v, int n, const void *p)
+{
+  const char *c = (const char *)p;
+  int lo = 0, hi = n - 1, m;
+  while (lo <= hi) {
+    m = (lo + hi) / 2;
+    if (c < v[m].lo) hi = m - 1;
+    else if (c >= v[m].hi) lo = m + 1;
+    else return m;
+  }
+  return -1;
+}
+
+/* which heap block holds p: a hash table on the address divided by the block size
+   (a block of BLKSZ bytes touches at most two such "pages", a big block more) */
+typedef struct { unsigned long pg; int sp; } HPg;
+static HPg *g_hpg;
+static unsigned long g_hpgcap;           /* a power of two */
+
+static void hpg_build(void)
+{
+  int i;
+  unsigned long n = 0, pg, last, h;
+  for (i = 0; i < g_hspn; i++)
+    n += ((unsigned long)g_hsp[i].hi - (unsigned long)g_hsp[i].lo) / (unsigned long)BLKSZ + 2;
+  for (g_hpgcap = 64; g_hpgcap < n * 3; g_hpgcap *= 2) ;
+  g_hpg = (HPg *)xrealloc(g_hpg, sizeof(HPg) * (size_t)g_hpgcap);
+  for (h = 0; h < g_hpgcap; h++) g_hpg[h].sp = -1;
+  for (i = 0; i < g_hspn; i++) {
+    if (g_hsp[i].hi == g_hsp[i].lo) continue;
+    last = ((unsigned long)g_hsp[i].hi - 1) / (unsigned long)BLKSZ;
+    for (pg = (unsigned long)g_hsp[i].lo / (unsigned long)BLKSZ; pg <= last; pg++) {
+      h = (pg * 2654435761UL) & (g_hpgcap - 1);
+      while (g_hpg[h].sp >= 0) h = (h + 1) & (g_hpgcap - 1);
+      g_hpg[h].pg = pg;
+      g_hpg[h].sp = i;
+    }
+  }
+}
+
+static int in_old(const void *p)
+{
+  unsigned long pg, h;
+  const char *c = (const char *)p;
+  if (p == NULL || g_hspn == 0) return 0;
+  pg = (unsigned long)c / (unsigned long)BLKSZ;
+  h = (pg * 2654435761UL) & (g_hpgcap - 1);
+  while (g_hpg[h].sp >= 0) {
+    if (g_hpg[h].pg == pg && c >= g_hsp[g_hpg[h].sp].lo && c < g_hsp[g_hpg[h].sp].hi) return 1;
+    h = (h + 1) & (g_hpgcap - 1);
+  }
+  return 0;
+}
+
+#define IN_OLD(p) in_old(p)
+#define HDR(p) ((unsigned long *)((char *)(p) - HDRSZ))
+
+static void *gc_fwd(void *p)
+{
+  if (!IN_OLD(p)) return p;
+  return *(void **)p;
+}
+
+static void gc_mark(const void *p)
+{
+  unsigned long *h;
+  if (p == NULL) return;
+  if (!in_old(p)) {
+    if (g_zspn > 0) {
+      int z = span_find(g_zsp, g_zspn, p);
+      if (z >= 0) ((Clause *)g_zsp[z].owner)->zmark = 1;
+    }
+    return;
+  }
+  h = HDR(p);
+  if (*h & HK_MARK) return;
+  *h |= HK_MARK;
+  if ((*h & HK_KIND) == HK_RAW) return;
+  if (g_msn >= g_mscap) {
+    g_mscap = g_mscap ? g_mscap * 2 : 4096;
+    g_mst = (void **)xrealloc(g_mst, sizeof(void *) * (size_t)g_mscap);
+  }
+  g_mst[g_msn++] = (void *)p;
+}
+
+/* Variable shunting.  The engine binds the caller's variable to the new clause
+   variable, so an argument passed unbound down a recursion becomes a chain
+   V0 -> V1 -> ... -> Vn.  During a collection a bound variable's "born" field holds
+   the index of its trail entry; V -> W -> X may become V -> X when no choice point
+   could undo W's binding but not V's: no trail mark m with tV < m <= tW.  Every
+   dereference gives the same result as before, at any later time. */
+static int shunt_ok(long tv, long tw)
+{
+  long lo = 0, hi = g_cpmn - 1, m;
+  if (tv >= tw) return 1;
+  while (lo <= hi) {                    /* first mark > tv */
+    m = (lo + hi) / 2;
+    if (g_cpm[m] > tv) hi = m - 1;
+    else lo = m + 1;
+  }
+  return lo >= g_cpmn || g_cpm[lo] > tw;
+}
+
+static void cpm_add(long m)
+{
+  if (g_cpmn >= g_cpmcap) {
+    g_cpmcap = g_cpmcap ? g_cpmcap * 2 : 1024;
+    g_cpm = (long *)xrealloc(g_cpm, sizeof(long) * (size_t)g_cpmcap);
+  }
+  g_cpm[g_cpmn++] = m;
+}
+
+static int long_cmp(const void *x, const void *y)
+{
+  long a = *(const long *)x, b = *(const long *)y;
+  return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+static void gc_shunt_prepare(void)
+{
+  long i;
+  g_cpmn = 0;
+  for (i = 0; i < g_sp; i++) cpm_add(g_stk[i].tmark);
+  for (i = 0; i < g_tombn; i++) cpm_add(g_tomb[i].tmark);
+  for (i = 0; i < g_nroots; i++) if (g_roots[i].kind == GR_TMARK) cpm_add(*(long *)g_roots[i].p);
+  qsort(g_cpm, (size_t)g_cpmn, sizeof(long), long_cmp);
+  for (i = 0; i < g_tn; i++)
+    if (IN_OLD(g_trail[i])) g_trail[i]->u.v.born = i;   /* reset by the copy */
+}
+
+static void gc_trace(void)
+{
+  int i;
+  while (g_msn > 0) {
+    void *p = g_mst[--g_msn];
+    if ((*HDR(p) & HK_KIND) == HK_GOAL) {
+      Goal *g = (Goal *)p;
+      gc_mark(g->t);
+      gc_mark(g->next);
+    } else {
+      Term *t = (Term *)p;
+      switch (t->tag) {
+      case T_VAR:
+        while (t->u.v.ref != NULL && t->u.v.ref->tag == T_VAR && t->u.v.ref->u.v.ref != NULL &&
+               IN_OLD(t->u.v.ref) && shunt_ok(t->u.v.born, t->u.v.ref->u.v.born)) {
+          t->u.v.ref = t->u.v.ref->u.v.ref;
+          g_gc_shunted++;
+        }
+        gc_mark(t->u.v.ref);
+        gc_mark(t->u.v.base);
+        break;
+      case T_NUM: gc_mark(t->u.n.txt); break;
+      case T_CMP:
+        for (i = 0; i < t->u.c.ar; i++) gc_mark(t->u.c.args[i]);
+        break;
+      default: break;
+      }
+    }
+  }
+}
+
+/* findall answers live in the findall's own arena and point to outer heap variables */
+static void gc_fa_term(Term **tp, int upd)
+{
+  int i, n;
+  Term *t;
+  for (;;) {
+    t = *tp;
+    if (IN_OLD(t)) {
+      if (upd) *tp = (Term *)gc_fwd(t);
+      else gc_mark(t);
+      return;
+    }
+    if (t->tag != T_CMP || t->u.c.ar == 0) return;
+    n = t->u.c.ar;
+    for (i = 0; i < n - 1; i++) gc_fa_term(&t->u.c.args[i], upd);
+    tp = &t->u.c.args[n - 1];
+  }
+}
+
+static void gc_t(Term **tp, int upd)
+{
+  if (upd) *tp = (Term *)gc_fwd(*tp);
+  else gc_mark(*tp);
+}
+
+static void gc_g(Goal **gp, int upd)
+{
+  if (upd) *gp = (Goal *)gc_fwd(*gp);
+  else gc_mark(*gp);
+}
+
+static void gc_vmap(VMap *m, int upd)
+{
+  int i;
+  for (i = 0; i < m->n; i++) gc_t(&m->e[i].var, upd);
+}
+
+/* visit every root: mark (upd = 0) or replace by the new address (upd = 1) */
+static void gc_roots(Goal **gp, int upd)
+{
+  long i, j;
+  if (gp != NULL) gc_g(gp, upd);
+  for (i = 0; i < g_nroots; i++) {
+    if (g_roots[i].kind == GR_TERM) gc_t((Term **)g_roots[i].p, upd);
+    else if (g_roots[i].kind == GR_GOAL) gc_g((Goal **)g_roots[i].p, upd);
+  }
+  for (i = 0; i < g_sp; i++) {
+    Frame *f = &g_stk[i];
+    gc_g(&f->rest, upd);
+    gc_t(&f->a, upd);
+    gc_t(&f->b, upd);
+    gc_t(&f->tmpl, upd);
+    gc_t(&f->savedtmpl, upd);
+    if (f->kind == F_FA && f->fa != NULL)
+      for (j = 0; j < f->fa->n; j++) gc_fa_term(&f->fa->res[j], upd);
+  }
+  for (i = 0; i < g_tombn; i++) gc_g(&g_tomb[i].rest, upd);
+  gc_t(&g_fatmpl, upd);
+  gc_vmap(&g_pvarmap, upd);
+  gc_vmap(&g_qvarmap, upd);
+}
+
+static void gm_add(int kind, void *p)
+{
+  if (g_gmn >= g_gmcap) {
+    g_gmcap = g_gmcap ? g_gmcap * 2 : 1024;
+    g_gm = (GMark *)xrealloc(g_gm, sizeof(GMark) * (size_t)g_gmcap);
+  }
+  g_gm[g_gmn].kind = kind;
+  g_gm[g_gmn].p = p;
+  if (kind == 0) {
+    AMark *m = (AMark *)p;
+    g_gm[g_gmn].pos = g_heap.b[m->blk].base + (long)m->off;
+  } else {
+    g_gm[g_gmn].pos = *(long *)p;
+  }
+  g_gmn++;
+}
+
+static int gm_cmp(const void *x, const void *y)
+{
+  const GMark *a = (const GMark *)x, *b = (const GMark *)y;
+  if (a->pos != b->pos) return a->pos < b->pos ? -1 : 1;
+  return 0;
+}
+
+/* every heap mark (kind 0, 1) or trail mark (kind 2) */
+static void gc_collect_marks(int trail)
+{
+  long i;
+  g_gmn = 0;
+  for (i = 0; i < g_nroots; i++) {
+    if (!trail && g_roots[i].kind == GR_AMARK) gm_add(0, g_roots[i].p);
+    if (trail && g_roots[i].kind == GR_TMARK) gm_add(2, g_roots[i].p);
+  }
+  for (i = 0; i < g_sp; i++) {
+    if (trail) gm_add(2, &g_stk[i].tmark);
+    else {
+      gm_add(0, &g_stk[i].hmark);
+      if (g_stk[i].kind == F_FA) gm_add(1, &g_stk[i].fapos);
+    }
+  }
+  for (i = 0; i < g_tombn; i++) {
+    if (trail) gm_add(2, &g_tomb[i].tmark);
+    else gm_add(0, &g_tomb[i].hmark);
+  }
+  if (!trail) gm_add(1, &g_fapos);
+  qsort(g_gm, (size_t)g_gmn, sizeof(GMark), gm_cmp);
+}
+
+static int zarr_cmp(const void *x, const void *y)
+{
+  const ZArr *a = (const ZArr *)x, *b = (const ZArr *)y;
+  if ((const char *)a->p < (const char *)b->p) return -1;
+  return (const char *)a->p > (const char *)b->p ? 1 : 0;
+}
+
+/* mark a retracted-storage array; 1 if p is one */
+static int zarr_note(const void *p)
+{
+  long lo = 0, hi = g_zarn - 1, m;
+  while (lo <= hi) {
+    m = (lo + hi) / 2;
+    if ((const char *)p < (const char *)g_zar[m].p) hi = m - 1;
+    else if ((const char *)p > (const char *)g_zar[m].p) lo = m + 1;
+    else {
+      g_zar[m].mark = 1;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* retracted clauses and old clause arrays that a frame can still try */
+static void gc_zombie_frames(void)
+{
+  long i;
+  int k;
+  if (g_zarn == 0) return;
+  qsort(g_zar, (size_t)g_zarn, sizeof(ZArr), zarr_cmp);
+  for (i = 0; i < g_zarn; i++) g_zar[i].mark = 0;
+  for (i = 0; i < g_sp; i++) {
+    Frame *f = &g_stk[i];
+    if (f->kind != F_USER || f->v == NULL) continue;
+    if (f->ipos != NULL) {
+      zarr_note(f->ipos);
+      zarr_note(f->pre);
+    }
+    /* a current clause array holds no retracted clause: only look into old ones */
+    if (!zarr_note(f->v)) continue;
+    for (k = f->i; k < f->n; k++)
+      if (f->v[k]->zmark == 0) f->v[k]->zmark = 1;
+  }
+}
+
+static void gc_free_zombies(void)
+{
+  long i, k;
+  g_zbytes = 0;
+  for (i = k = 0; i < g_zcln; i++) {
+    Clause *c = g_zcl[i];
+    if (c->zmark == 1) {
+      c->zmark = 0;
+      g_zcl[k++] = c;
+      g_zbytes += (unsigned long)c->msz;
+    } else {
+      free(c->mem);              /* the Clause itself is in this block */
+      g_gc_clfreed++;
+    }
+  }
+  g_zcln = k;
+  for (i = k = 0; i < g_zarn; i++) {
+    if (g_zar[i].mark) {
+      g_zar[k] = g_zar[i];
+      g_zar[k].mark = 0;
+      g_zbytes += (unsigned long)g_zar[k].sz;
+      k++;
+    } else {
+      free(g_zar[i].p);
+    }
+  }
+  g_zarn = k;
+}
+
+static void gc_collect(Goal **gp)
+{
+  Arena na;
+  long i, mi, k, before, opos, npos;
+  int b;
+  clock_t t0 = clock();
+  g_gc_req = 0;
+  g_gc_tick = 0;
+  before = apos(&g_heap);
+  if (before > g_gc_peak) g_gc_peak = before;
+
+  /* the blocks of the heap, and the retracted clauses, sorted by address */
+  g_hspn = 0;
+  if (g_heap.n > 0) {
+    g_hsp = (GSpan *)xrealloc(g_hsp, sizeof(GSpan) * (size_t)(g_heap.cur + 1));
+    for (b = 0; b <= g_heap.cur; b++) {
+      g_hsp[g_hspn].lo = g_heap.b[b].p;
+      g_hsp[g_hspn].hi = g_heap.b[b].p + g_heap.b[b].used;
+      g_hsp[g_hspn].owner = NULL;
+      g_hspn++;
+    }
+    qsort(g_hsp, (size_t)g_hspn, sizeof(GSpan), gspan_cmp);
+    hpg_build();
+  }
+  g_zspn = 0;
+  if (g_zcln > 0) {
+    g_zsp = (GSpan *)xrealloc(g_zsp, sizeof(GSpan) * (size_t)g_zcln);
+    for (i = 0; i < g_zcln; i++) {
+      g_zcl[i]->zmark = 0;
+      g_zsp[i].lo = g_zcl[i]->mem;
+      g_zsp[i].hi = g_zcl[i]->mem + g_zcl[i]->msz;
+      g_zsp[i].owner = g_zcl[i];
+    }
+    g_zspn = (int)g_zcln;
+    qsort(g_zsp, (size_t)g_zspn, sizeof(GSpan), gspan_cmp);
+  }
+
+  /* mark */
+  if (g_heap.n > 0) gc_shunt_prepare();
+  gc_zombie_frames();
+  gc_roots(gp, 0);
+  gc_trace();
+
+  if (g_heap.n > 0) {
+    /* copy the live objects in order; a heap mark goes to the first live object at
+       or after it, or to the new top */
+    gc_collect_marks(0);
+    memset(&na, 0, sizeof na);
+    mi = 0;
+    for (b = 0; b <= g_heap.cur; b++) {
+      Blk *bk = &g_heap.b[b];
+      size_t off = 0, sz;
+      while (off < bk->used) {
+        char *o = bk->p + off, *nw;
+        unsigned long h = *(unsigned long *)o;
+        sz = (size_t)(h & ~7UL);
+        if (sz < HDRSZ) die("internal error: heap header");
+        if (h & HK_MARK) {
+          nw = (char *)aalloc(&na, sz);
+          npos = na.b[na.cur].base + (long)(na.b[na.cur].used - sz);
+          opos = bk->base + (long)off;
+          for (; mi < g_gmn && g_gm[mi].pos <= opos; mi++) {
+            g_gm[mi].pos = npos;
+            if (g_gm[mi].kind == 0) {
+              ((AMark *)g_gm[mi].p)->blk = na.cur;
+              ((AMark *)g_gm[mi].p)->off = na.b[na.cur].used - sz;
+            }
+          }
+          memcpy(nw, o, sz);
+          *(unsigned long *)nw = h & ~HK_MARK;
+          if ((h & HK_KIND) == HK_TERM && ((Term *)(nw + HDRSZ))->tag == T_VAR)
+            ((Term *)(nw + HDRSZ))->u.v.born = npos;
+          *(void **)(o + HDRSZ) = nw + HDRSZ;      /* forwarding address */
+        }
+        off += sz;
+      }
+    }
+    for (; mi < g_gmn; mi++) {
+      g_gm[mi].pos = apos(&na);
+      if (g_gm[mi].kind == 0) *(AMark *)g_gm[mi].p = amark(&na);
+    }
+    for (mi = 0; mi < g_gmn; mi++)
+      if (g_gm[mi].kind == 1) *(long *)g_gm[mi].p = g_gm[mi].pos;
+
+    /* new addresses inside the copies */
+    for (b = 0; b < na.n && b <= na.cur; b++) {
+      Blk *bk = &na.b[b];
+      size_t off = 0, sz;
+      while (off < bk->used) {
+        char *o = bk->p + off;
+        unsigned long h = *(unsigned long *)o;
+        sz = (size_t)(h & ~7UL);
+        if ((h & HK_KIND) == HK_GOAL) {
+          Goal *g = (Goal *)(o + HDRSZ);
+          g->t = (Term *)gc_fwd(g->t);
+          g->next = (Goal *)gc_fwd(g->next);
+        } else if ((h & HK_KIND) == HK_TERM) {
+          Term *t = (Term *)(o + HDRSZ);
+          int j;
+          switch (t->tag) {
+          case T_VAR:
+            t->u.v.ref = (Term *)gc_fwd(t->u.v.ref);
+            t->u.v.base = (const char *)gc_fwd((void *)t->u.v.base);
+            break;
+          case T_NUM: t->u.n.txt = (const char *)gc_fwd((void *)t->u.n.txt); break;
+          case T_CMP:
+            t->u.c.args = (Term **)(t + 1);
+            for (j = 0; j < t->u.c.ar; j++) t->u.c.args[j] = (Term *)gc_fwd(t->u.c.args[j]);
+            break;
+          default: break;
+          }
+        }
+        off += sz;
+      }
+    }
+    gc_roots(gp, 1);
+
+    /* the trail: drop entries of dead variables */
+    gc_collect_marks(1);
+    mi = 0;
+    for (i = k = 0; i < g_tn; i++) {
+      Term *v = g_trail[i];
+      for (; mi < g_gmn && g_gm[mi].pos <= i; mi++) *(long *)g_gm[mi].p = k;
+      if (!IN_OLD(v)) g_trail[k++] = v;
+      else if (*HDR(v) & HK_MARK) g_trail[k++] = (Term *)gc_fwd(v);
+    }
+    for (; mi < g_gmn; mi++) *(long *)g_gm[mi].p = k;
+    g_tn = k;
+
+    /* the new heap replaces the old one */
+    for (b = 0; b < g_heap.n; b++) free(g_heap.b[b].p);
+    free(g_heap.b);
+    g_heap = na;
+    g_heap.hdr = 1;
+  }
+  g_hspn = 0;
+  gc_free_zombies();
+  g_zspn = 0;
+
+  g_gc_live = apos(&g_heap);
+  g_gc_freed += (double)(before - g_gc_live);
+  /* next time when the heap has doubled; tripled... when this collection freed less
+     than half (data kept by choice points), so that copying stays a small cost */
+  i = g_gc_live * (before - g_gc_live < g_gc_live ? 3 : 1);
+  g_gc_next = g_gc_live + (i > GC_MIN ? i : GC_MIN);
+  g_gc_znext = (long)g_zbytes + (g_zbytes > (unsigned long)GC_MIN ? (long)g_zbytes : GC_MIN);
+  g_gc_count++;
+  g_gc_secs += (double)(clock() - t0) / (double)CLOCKS_PER_SEC;
+  if (g_gc_verbose) {
+    fprintf(stderr, "%% gc %lu: heap %ld -> %ld bytes, trail %ld, frames %ld, "
+            "clauses waiting %ld\n", g_gc_count, before, g_gc_live, g_tn, g_sp, g_zcln);
+  }
+}
+
+static void gc_stats(void)
+{
+  char b[160];
+  say("% garbage collector:");
+  sprintf(b, "%%   collections %lu (%s), %.3f s", g_gc_count,
+          g_gc_on ? (g_gc_stress > 0 ? "stress mode" : "automatic") : "off", g_gc_secs);
+  say(b);
+  sprintf(b, "%%   heap now %ld bytes, live after last collection %ld, largest %ld",
+          apos(&g_heap), g_gc_live, g_gc_peak > apos(&g_heap) ? g_gc_peak : apos(&g_heap));
+  say(b);
+  sprintf(b, "%%   reclaimed %.0f bytes, next collection at %ld", g_gc_freed, g_gc_next);
+  say(b);
+  sprintf(b, "%%   trail %ld entries, frames %ld, elided frames %lu", g_tn, g_sp, g_nelided);
+  say(b);
+  sprintf(b, "%%   retracted clauses freed %lu, waiting %ld (%lu bytes with old arrays)",
+          g_gc_clfreed, g_zcln, g_zbytes);
+  say(b);
+}
 /* ===== p6_bi.c ===== */
 /* p6_bi.c - built-in predicates */
 
@@ -2982,7 +3961,7 @@ enum {
   BI_CHAR_CODE, BI_ATOM_CONCAT, BI_UPCASE, BI_DOWNCASE, BI_ASSERT, BI_ASSERTA,
   BI_ASSERTZ, BI_RETRACT, BI_RETRACTALL, BI_WRITE, BI_WRITELN, BI_NL, BI_PRINT,
   BI_TAB, BI_CONSULT, BI_LISTING0, BI_LISTINGALL, BI_LISTING1, BI_SAVE, BI_SAVEALL,
-  BI_LOAD, BI_CXCALL2, BI_CXCALL3, BI_HALT0, BI_HALT1
+  BI_LOAD, BI_CXCALL2, BI_CXCALL3, BI_HALT0, BI_HALT1, BI_GC0, BI_GC1, BI_STATS
 };
 
 static void reg_bi(const char *name, int ar, int id)
@@ -3054,6 +4033,9 @@ static void init_builtins(void)
   reg_bi("crexx_call", 3, BI_CXCALL3);
   reg_bi("halt", 0, BI_HALT0);
   reg_bi("halt", 1, BI_HALT1);
+  reg_bi("garbage_collect", 0, BI_GC0);
+  reg_bi("gc", 1, BI_GC1);
+  reg_bi("statistics", 0, BI_STATS);
 }
 
 static int is_builtin(Sym *fn, int ar)
@@ -3190,7 +4172,12 @@ static void consult_string(const char *text)
     if (t == NULL) break;
     if (t->tag == T_CMP && t->u.c.fn == S_NECK && t->u.c.ar == 1) {
       long mark = trail_mark();
-      int ok = solve_once(t->u.c.args[0]);
+      int ok;
+      groot(GR_AMARK, &hm);
+      groot(GR_TERM, &t);
+      groot(GR_TMARK, &mark);
+      ok = solve_once(t->u.c.args[0]);
+      g_nroots -= 3;
       if (!ok) {
         charout("prolog: directive failed: ");
         say(write_term(t, 1));
@@ -3689,6 +4676,25 @@ static int bi_exec(int id, Term *goal)
     fflush(stdout);
     exit((int)a.d);
   }
+  case BI_GC0:                  /* collected at the next safe point, right after this goal */
+    g_gc_req = 1;
+    return 1;
+  case BI_GC1:                  /* gc(on), gc(off), gc(N): stress mode, every N inferences */
+    v = deref(A[0]);
+    if (v->tag == T_NUM) {
+      g_gc_stress = (long)num_val(v->u.n.txt);
+      g_gc_on = 1;
+      return 1;
+    }
+    if (v->tag != T_ATOM && v->tag != T_QATOM) return 0;
+    if (strcmp(v->u.a.sym->text, "on") == 0) g_gc_on = 1;
+    else if (strcmp(v->u.a.sym->text, "off") == 0) g_gc_on = 0;
+    else return 0;
+    g_gc_stress = 0;
+    return 1;
+  case BI_STATS:
+    gc_stats();
+    return 1;
   default: break;
   }
   say("prolog: internal error -- unimplemented builtin");
@@ -3774,6 +4780,7 @@ static void init_engine(void)
   g_callcount = 0;
   g_fa = NULL;
   g_fatmpl = NULL;
+  g_tombn = g_tbase = 0;
   if (g_heap.n > 0) {
     AMark z;
     z.blk = 0;
@@ -3784,6 +4791,12 @@ static void init_engine(void)
     Sym *y;
     for (y = g_symtab[i]; y; y = y->next)
       for (p = y->preds; p; p = p->next) {
+        int k;
+        for (k = 0; k < p->n; k++) zombie_clause(p->v[k]);
+        zombie_arr(p->v, sizeof(Clause *) * (size_t)p->cap);
+        zombie_idx(p->idx);
+        p->v = NULL;
+        p->cap = 0;
         p->n = 0;
         p->listed = 0;
         p->idx = NULL;
@@ -3929,7 +4942,10 @@ static int handle_syscmd(char *ln)
     say("prolog: workspace cleared.");
   } else if (strcmp(up, ")LIB") == 0) sys_lib(strip_blanks(rest));
   else if (strcmp(up, ")HELP") == 0 || strcmp(up, ")?") == 0) sys_help();
-  else if (strcmp(up, ")QUIT") == 0 || strcmp(up, ")EXIT") == 0) return 1;
+  else if (strcmp(up, ")GC") == 0) {
+    gc_collect(NULL);
+    gc_stats();
+  } else if (strcmp(up, ")QUIT") == 0 || strcmp(up, ")EXIT") == 0) return 1;
   else {
     charout("prolog: unknown session command: ");
     charout(cmd);
@@ -3974,7 +4990,9 @@ static void solve_interact_show(Term *g)
   vmap_copy(&g_qvarmap, &g_pvarmap);
   g_mode = M_INTERACT;
   mark = trail_mark();
+  groot(GR_TMARK, &mark);
   ok = run(new_goal(g, NULL));
+  g_nroots--;
   g_mode = M_FIRST;
   if (!ok) say("false.");
   trail_undo(mark);
@@ -4024,6 +5042,7 @@ static void run_top_level(void)
       continue;
     }
     hm = amark(&g_heap);
+    groot(GR_AMARK, &hm);
     tokenize(ln);
     while (g_ppos < g_ntok) {
       Term *goal = parse_clause();
@@ -4042,12 +5061,32 @@ static void run_top_level(void)
       }
     }
     free(raw);
+    g_nroots--;
     arelease(&g_heap, hm);
+  }
+}
+
+/* PROLOG_GC: comma separated off | stress=N | verbose | noelide (see README.md) */
+static void gc_options(void)
+{
+  const char *e = getenv("PROLOG_GC"), *p;
+  if (e == NULL) return;
+  for (p = e; *p; ) {
+    if (strncmp(p, "off", 3) == 0) g_gc_on = 0;
+    else if (strncmp(p, "verbose", 7) == 0) g_gc_verbose = 1;
+    else if (strncmp(p, "noelide", 7) == 0) g_elide = 0;
+    else if (strncmp(p, "stress", 6) == 0) {
+      g_gc_stress = p[6] == '=' ? atol(p + 7) : 1;
+      if (g_gc_stress < 1) g_gc_stress = 1;
+    }
+    while (*p && *p != ',') p++;
+    if (*p == ',') p++;
   }
 }
 
 int main(int argc, char **argv)
 {
+  gc_options();
   init_syms();
   init_ops();
   init_builtins();

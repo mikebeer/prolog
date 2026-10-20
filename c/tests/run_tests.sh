@@ -24,11 +24,15 @@ for src in "$ROOT"/tests/*.pl; do
     fi
   fi
 done
-# C-only tests (tests/c_only/NAME.pl, expected NAME.out): long sorts, first-argument index
+# C-only tests (tests/c_only/NAME.pl, expected NAME.out): long sorts, first-argument index,
+# long loops for the garbage collector.  They hold a lot of live data, so a stress mode
+# (PROLOG_GC=stress=N, see README.md) collects every 20000 inferences only.
+CGC=${PROLOG_GC-}
+case "$CGC" in *stress*) CGC=$(echo "$CGC" | sed 's/stress=*[0-9]*/stress=20000/') ;; esac
 for src in "$DIR"/c_only/*.pl; do
   [ -f "$src" ] || continue
   name=c_only/$(basename "$src" .pl)
-  actual=$(cd "$DIR/c_only" && timeout 300 "$PL" "$(basename "$src")" < /dev/null 2>&1)
+  actual=$(cd "$DIR/c_only" && PROLOG_GC=$CGC timeout 300 "$PL" "$(basename "$src")" < /dev/null 2>&1)
   if [ "$actual" = "$(cat "${src%.pl}.out")" ]; then
     pass=$((pass+1)); echo "ok   $name"
   else

@@ -62,6 +62,60 @@ struct PIdx {
   int bad;                 /* too many variable-first-argument clauses: do not use */
 };
 
+/* ---- storage no longer reachable from the database --------------------------
+   Retracted clauses, clause arrays replaced by assert / retract and the arrays of
+   dropped first-argument indexes can still be in use: a running call holds the
+   array and walks its clauses, and terms made from a clause share its ground
+   sub-terms, numbers and variable names.  They wait on these lists and the garbage
+   collector (p5_gc.c) frees them once nothing refers to them any more. */
+typedef struct { void *p; size_t sz; int mark; } ZArr;
+static Clause **g_zcl;
+static long g_zcln, g_zclcap;
+static ZArr *g_zar;
+static long g_zarn, g_zarcap;
+static unsigned long g_zbytes;      /* bytes waiting on the two lists */
+
+static void zombie_arr(void *p, size_t sz)
+{
+  if (p == NULL) return;
+  if (g_zarn >= g_zarcap) {
+    g_zarcap = g_zarcap ? g_zarcap * 2 : 64;
+    g_zar = (ZArr *)xrealloc(g_zar, sizeof(ZArr) * (size_t)g_zarcap);
+  }
+  g_zar[g_zarn].p = p;
+  g_zar[g_zarn].sz = sz;
+  g_zar[g_zarn].mark = 0;
+  g_zarn++;
+  g_zbytes += (unsigned long)sz;
+}
+
+static void zombie_clause(Clause *c)
+{
+  if (g_zcln >= g_zclcap) {
+    g_zclcap = g_zclcap ? g_zclcap * 2 : 64;
+    g_zcl = (Clause **)xrealloc(g_zcl, sizeof(Clause *) * (size_t)g_zclcap);
+  }
+  c->zmark = 0;
+  g_zcl[g_zcln++] = c;
+  g_zbytes += (unsigned long)c->msz;
+}
+
+static void zombie_idx(PIdx *x)
+{
+  int i;
+  if (x == NULL) return;
+  zombie_arr(x->pre, sizeof(long) * (size_t)x->precap);
+  zombie_arr(x->wild.c, sizeof(Clause *) * (size_t)x->wild.cap);
+  zombie_arr(x->wild.pos, sizeof(int) * (size_t)x->wild.cap);
+  for (i = 0; i < x->tcap; i++) {
+    if (!x->tab[i].kind) continue;
+    zombie_arr(x->tab[i].b.c, sizeof(Clause *) * (size_t)x->tab[i].b.cap);
+    zombie_arr(x->tab[i].b.pos, sizeof(int) * (size_t)x->tab[i].b.cap);
+  }
+  free(x->tab);            /* running calls hold bucket arrays, never the table */
+  free(x);
+}
+
 /* key of a (dereferenced, non-variable) first argument; 0 = no key */
 static int idx_key(Term *t, const void **p, double *d, int *ar)
 {
@@ -112,6 +166,8 @@ static void ibkt_add(IBkt *b, Clause *c, int pos)
       memcpy(nc, b->c, sizeof(Clause *) * (size_t)b->n);
       memcpy(np, b->pos, sizeof(int) * (size_t)b->n);
     }
+    zombie_arr(b->c, sizeof(Clause *) * (size_t)b->cap);
+    zombie_arr(b->pos, sizeof(int) * (size_t)b->cap);
     b->c = nc;
     b->pos = np;
     b->cap = ncap;
@@ -177,6 +233,7 @@ static int idx_append(PIdx *x, Clause *c, int pos)
     int ncap = x->precap ? x->precap * 2 : 16;
     long *np = (long *)xmalloc(sizeof(long) * (size_t)ncap);
     if (x->precap) memcpy(np, x->pre, sizeof(long) * (size_t)x->precap);
+    zombie_arr(x->pre, sizeof(long) * (size_t)x->precap);
     x->pre = np;
     x->precap = ncap;
   }
@@ -231,6 +288,7 @@ static PIdx *idx_for_call(Pred *p, Term *a, IBkt **bk)
   if (kind == 0) return NULL;
   x = p->idx;
   if (x == NULL || x->v != p->v || x->n != p->n) {
+    zombie_idx(x);
     x = idx_build(p);
     p->idx = x;
   }
@@ -248,7 +306,10 @@ static void pred_add(Pred *p, Clause *c, int atz)
 {
   int keep = atz && p->idx != NULL && !p->idx->bad && p->idx->v == p->v && p->idx->n == p->n;
   pred_note_listed(p);
-  if (!keep) p->idx = NULL;
+  if (!keep) {
+    zombie_idx(p->idx);
+    p->idx = NULL;
+  }
   if (atz) {
     if (p->n < p->cap) {
       p->v[p->n++] = c;
@@ -258,6 +319,7 @@ static void pred_add(Pred *p, Clause *c, int atz)
       nv = (Clause **)xmalloc(sizeof(Clause *) * (size_t)ncap);
       if (p->n) memcpy(nv, p->v, sizeof(Clause *) * (size_t)p->n);
       nv[p->n++] = c;
+      zombie_arr(p->v, sizeof(Clause *) * (size_t)p->cap);
       p->v = nv;
       p->cap = ncap;
     }
@@ -265,13 +327,17 @@ static void pred_add(Pred *p, Clause *c, int atz)
     Clause **nv = (Clause **)xmalloc(sizeof(Clause *) * (size_t)(p->n + 4));
     if (p->n) memcpy(nv + 1, p->v, sizeof(Clause *) * (size_t)p->n);
     nv[0] = c;
+    zombie_arr(p->v, sizeof(Clause *) * (size_t)p->cap);
     p->v = nv;
     p->n++;
     p->cap = p->n + 3;
   }
   if (keep) {
     p->idx->v = p->v;
-    if (!idx_append(p->idx, c, p->n - 1)) p->idx = NULL;
+    if (!idx_append(p->idx, c, p->n - 1)) {
+      zombie_idx(p->idx);
+      p->idx = NULL;
+    }
   }
 }
 
@@ -279,6 +345,8 @@ static void pred_set(Pred *p, Clause **keep, int n)
 {
   Clause **nv = (Clause **)xmalloc(sizeof(Clause *) * (size_t)(n + 4));
   if (n) memcpy(nv, keep, sizeof(Clause *) * (size_t)n);
+  zombie_arr(p->v, sizeof(Clause *) * (size_t)p->cap);
+  zombie_idx(p->idx);
   p->v = nv;
   p->n = n;
   p->cap = n + 4;
@@ -308,23 +376,49 @@ static int is_gnd(Term *t)
   return t->tag == T_ATOM || t->tag == T_QATOM || t->tag == T_NUM;
 }
 
-static Term *tmpl_build(Term *t, VList *vl)
+#define RND8(n) (((size_t)(n) + 7) & ~(size_t)7)
+
+/* the bytes tmpl_build will take (aalloc rounds every piece to 8) */
+static size_t tmpl_size(Term *t, VList *vl)
+{
+  size_t sz = 0;
+  int i, n;
+  for (;;) {
+    t = deref(t);
+    switch (t->tag) {
+    case T_VAR:
+      vl_index(vl, t);
+      return sz + RND8(sizeof(Term));
+    case T_NUM: return sz + RND8(sizeof(Term)) + RND8(strlen(t->u.n.txt) + 1);
+    case T_CMP:
+      n = t->u.c.ar;
+      sz += RND8(sizeof(Term) + sizeof(Term *) * (size_t)(n ? n : 1));
+      if (n == 0) return sz;
+      for (i = 0; i < n - 1; i++) sz += tmpl_size(t->u.c.args[i], vl);
+      t = t->u.c.args[n - 1];
+      break;
+    default: return sz;
+    }
+  }
+}
+
+static Term *tmpl_build(Arena *ca, Term *t, VList *vl)
 {
   t = deref(t);
   switch (t->tag) {
   case T_VAR: {
-    Term *x = (Term *)aalloc(&g_perm, sizeof(Term));
+    Term *x = (Term *)aalloc(ca, sizeof(Term));
     x->tag = T_TV;
     x->gnd = 0;
     x->u.x.idx = vl_index(vl, t);
     return x;
   }
-  case T_NUM: return mk_numa(&g_perm, t->u.n.txt);
+  case T_NUM: return mk_numa(ca, t->u.n.txt);
   case T_CMP: {
     int i, n = t->u.c.ar, g = 1;
-    Term *r = mk_cmpa(&g_perm, t->u.c.fn, n);
+    Term *r = mk_cmpa(ca, t->u.c.fn, n);
     for (i = 0; i < n; i++) {
-      r->u.c.args[i] = tmpl_build(t->u.c.args[i], vl);
+      r->u.c.args[i] = tmpl_build(ca, t->u.c.args[i], vl);
       if (!is_gnd(r->u.c.args[i])) g = 0;
     }
     r->gnd = g;
@@ -357,6 +451,8 @@ static void assert_clause(Term *term, int atz)
   Sym *fn;
   Pred *p;
   Buf nb;
+  Arena ca;
+  size_t sz;
   if (term->tag == T_CMP && term->u.c.fn == S_NECK && term->u.c.ar == 2) {
     head = term->u.c.args[0];
     flatten_conj(term->u.c.args[1], &goals, &ng, &gcap);
@@ -364,22 +460,46 @@ static void assert_clause(Term *term, int atz)
   fn = functor_of(head, &ar);
   p = pred_find(fn, ar, 1);
   g_clcount++;
-  c = (Clause *)xmalloc(sizeof(Clause));
-  c->id = g_clcount;
+  /* the clause lives in one block of exactly the size it needs, so that it can be
+     freed after retract (see zombie_clause) */
   vl.v = NULL; vl.n = vl.cap = 0;
-  c->head = tmpl_build(head, &vl);
-  c->nhead = vl.n;
-  c->nbody = ng;
-  c->body = (Term **)aalloc(&g_perm, sizeof(Term *) * (size_t)(ng ? ng : 1));
-  for (i = 0; i < ng; i++) c->body[i] = tmpl_build(goals[i], &vl);
-  c->nvars = vl.n;
-  c->vn = (char **)aalloc(&g_perm, sizeof(char *) * (size_t)(vl.n ? vl.n : 1));
   nb.s = NULL; nb.n = nb.cap = 0;
+  sz = RND8(sizeof(Clause)) + tmpl_size(head, &vl);
+  for (i = 0; i < ng; i++) sz += tmpl_size(goals[i], &vl);
+  sz += RND8(sizeof(Term *) * (size_t)(ng ? ng : 1));
+  sz += RND8(sizeof(char *) * (size_t)(vl.n ? vl.n : 1));
   for (i = 0; i < vl.n; i++) {
     bclear(&nb);
     var_name(vl.v[i], &nb);
-    c->vn[i] = astrdup(&g_perm, bstr(&nb));
+    sz += RND8(nb.n + 1);
   }
+  vl.n = 0;
+  memset(&ca, 0, sizeof ca);
+  ca.ncap = ca.n = 1;
+  ca.b = (Blk *)xmalloc(sizeof(Blk));
+  ca.b[0].p = (char *)xmalloc(sz);
+  ca.b[0].cap = sz;
+  ca.b[0].used = 0;
+  ca.b[0].base = 0;
+  c = (Clause *)aalloc(&ca, sizeof(Clause));
+  c->mem = ca.b[0].p;
+  c->msz = sz;
+  c->zmark = -1;
+  c->id = g_clcount;
+  c->head = tmpl_build(&ca, head, &vl);
+  c->nhead = vl.n;
+  c->nbody = ng;
+  c->body = (Term **)aalloc(&ca, sizeof(Term *) * (size_t)(ng ? ng : 1));
+  for (i = 0; i < ng; i++) c->body[i] = tmpl_build(&ca, goals[i], &vl);
+  c->nvars = vl.n;
+  c->vn = (char **)aalloc(&ca, sizeof(char *) * (size_t)(vl.n ? vl.n : 1));
+  for (i = 0; i < vl.n; i++) {
+    bclear(&nb);
+    var_name(vl.v[i], &nb);
+    c->vn[i] = astrdup(&ca, bstr(&nb));
+  }
+  if (ca.n != 1 || ca.b[0].used != sz) die("internal error: clause size");
+  free(ca.b);
   free(nb.s);
   free(vl.v);
   free(goals);
@@ -409,7 +529,7 @@ static Term *inst(Term *t, Term **fr, Clause *c, long cbase)
 static Term *inst_goal(Term *t, Term **fr, Clause *c, long cbase, long barrier)
 {
   if (t->tag == T_ATOM && t->u.a.sym == S_BANG) {
-    Term *x = (Term *)aalloc(&g_heap, sizeof(Term));
+    Term *x = (Term *)aalloc_k(&g_heap, sizeof(Term), HK_TERM);
     x->tag = T_CUT;
     x->gnd = 0;
     x->u.x.idx = barrier;
@@ -504,6 +624,7 @@ static int retract_clause(Term *headpat, Term *bodypat)
       for (j = 0; j < n; j++) if (v[j] != c) keep[k++] = v[j];
       pred_set(p, keep, k);
       free(keep);
+      zombie_clause(c);
       return 1;
     }
     trail_undo(tm);
@@ -531,6 +652,7 @@ static void retract_all(Term *pat)
     rh = inst(c->head, fr, c, g_rvc);
     g_rvc += c->nhead;
     if (!unify(pat, rh)) keep[k++] = c;
+    else zombie_clause(c);
     trail_undo(tm);
     arelease(&g_heap, hm);
   }

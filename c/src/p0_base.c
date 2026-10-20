@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #ifdef PL_POSIX
 #include <dirent.h>
 #endif
@@ -47,6 +48,9 @@ struct Clause {
   int nbody;
   int nvars, nhead;
   char **vn;
+  char *mem;               /* one block: this struct, the templates, body and names */
+  size_t msz;
+  int zmark;               /* retracted clause still in use (garbage collector) */
 };
 
 struct Pred {
@@ -65,10 +69,18 @@ typedef struct { char *s; size_t n, cap; } Buf;
 
 /* arena with mark / release */
 typedef struct { char *p; size_t cap, used; long base; } Blk;
-typedef struct { Blk *b; int n, ncap, cur; } Arena;
+typedef struct { Blk *b; int n, ncap, cur; int hdr; } Arena;
 typedef struct { int blk; size_t off; } AMark;
 
-static Arena g_heap, g_perm;
+/* Every object of the heap (hdr = 1) starts with a header word: its size in bytes
+   (header included, a multiple of 8), the kind (bits 0-1) and the collector's mark
+   (bit 2).  The garbage collector (p5_gc.c) walks the heap with it. */
+#define HDRSZ 8
+enum { HK_RAW, HK_TERM, HK_GOAL };
+#define HK_KIND 3UL
+#define HK_MARK 4UL
+
+static Arena g_heap = { NULL, 0, 0, 0, 1 }, g_perm;
 static Sym *g_symtab[NSYMH];
 
 static void die(const char *msg)
@@ -101,11 +113,13 @@ static char *xstrdup(const char *s)
 }
 
 /* ---- arena ---- */
-static void *aalloc(Arena *a, size_t n)
+static void *aalloc_k(Arena *a, size_t n, int kind)
 {
   Blk *b;
-  void *r;
+  char *r;
+  if (a->hdr && n < sizeof(void *)) n = sizeof(void *);   /* room for a forwarding pointer */
   n = (n + 7) & ~(size_t)7;
+  if (a->hdr) n += HDRSZ;
   if (a->n == 0) {
     a->ncap = 8;
     a->b = (Blk *)xmalloc(sizeof(Blk) * (size_t)a->ncap);
@@ -138,8 +152,14 @@ static void *aalloc(Arena *a, size_t n)
   b = &a->b[a->cur];
   r = b->p + b->used;
   b->used += n;
+  if (a->hdr) {
+    *(unsigned long *)r = (unsigned long)n | (unsigned long)kind;
+    r += HDRSZ;
+  }
   return r;
 }
+
+static void *aalloc(Arena *a, size_t n) { return aalloc_k(a, n, HK_RAW); }
 
 static long apos(Arena *a)
 {

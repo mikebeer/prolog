@@ -1,0 +1,17 @@
+count_done
+cnt_done
+3000045000193680
+59542
+150000
+300000
+50000
+fd_done
+nrev_done
+99
+50000 - 1250025000
+f(_G244,g(_G246))
+Prolog-in-CREXX -- type )help for session commands, halt. to quit
+(end a QUERY with ? -- e.g. female(ann)?  or parent(tom,X)? -- end a FACT or RULE with . to add it -- e.g. female(ann). or foo(X):-bar(X).)
+?-
+
+goodbye.

@@ -16,8 +16,16 @@
   a directory is not supported. Input is read with `fgets` from stdin,
   files with `fopen`; both are standard C.
 * Memory: two arenas allocated in 256 KB blocks (`BLKSZ` in `p0_base.c`);
-  reduce it for a small region. The heap is released on backtracking, so a
-  long failure-driven loop runs in constant space.
+  reduce it for a small region. The heap is released on backtracking, and the
+  garbage collector (`p5_gc.c`, README.md "Memory and garbage collection")
+  reclaims what deterministic code leaves behind. It collects when the heap has
+  grown past twice the live data, at least `GC_MIN` bytes (4 MB; compile with
+  `-DGC_MIN=1048576` or less for a small region), and needs room for a second copy
+  of the live data while it runs. Heap objects carry an 8-byte header. The
+  collector compares pointers into different `malloc` blocks with `<` to find
+  the block an address lies in; strictly this is undefined in C89, but it works
+  on every flat-address implementation (S/370 included). `PROLOG_GC` is read with `getenv`; where there is
+  no environment, use `gc/1` in the program.
 * Printing doubles uses `sprintf("%.40e")` and rounds the digit string
   itself; a C library without exact `%e` output may differ in the last digit.
 * Known differences from CREXX are listed in `README.md`.

@@ -39,7 +39,7 @@ static Term *mk_atom_s(const char *s) { return mk_atom(intern(s)); }
 static Term *mk_var(const char *base, int sep, long ctr)
 {
   long b = apos(&g_heap);
-  Term *t = (Term *)aalloc(&g_heap, sizeof(Term));
+  Term *t = (Term *)aalloc_k(&g_heap, sizeof(Term), HK_TERM);
   t->tag = T_VAR;
   t->gnd = 0;
   t->u.v.ref = NULL;
@@ -52,7 +52,7 @@ static Term *mk_var(const char *base, int sep, long ctr)
 
 static Term *mk_numa(Arena *a, const char *txt)
 {
-  Term *t = (Term *)aalloc(a, sizeof(Term));
+  Term *t = (Term *)aalloc_k(a, sizeof(Term), HK_TERM);
   t->tag = T_NUM;
   t->gnd = 1;
   t->u.n.txt = astrdup(a, txt);
@@ -70,7 +70,7 @@ static Term *mk_long(long v)
 
 static Term *mk_cmpa(Arena *a, Sym *fn, int ar)
 {
-  Term *t = (Term *)aalloc(a, sizeof(Term) + sizeof(Term *) * (size_t)(ar ? ar : 1));
+  Term *t = (Term *)aalloc_k(a, sizeof(Term) + sizeof(Term *) * (size_t)(ar ? ar : 1), HK_TERM);
   int i;
   t->tag = T_CMP;
   t->gnd = 0;
